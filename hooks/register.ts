@@ -1,8 +1,11 @@
-import type { EngineInterface, ModelForkResult, Register } from 'claude-code'
+import type { EngineInterface, ModelForkResult, PromptSubmitInput, Register } from 'claude-code'
 
 import {
   appendLog,
+  cacheGoneAt,
+  coldPromptQuestion,
   decide,
+  decideIntercept,
   filesModified,
   handoffPrompt,
   lastRealRowAt,
@@ -10,17 +13,21 @@ import {
   missingSections,
   observeCache,
   offerQuestion,
+  parseAutoLoad,
   parseMeta,
   renderHandoff,
   resolveTtl,
   secondsRemaining,
   shouldOffer,
   snapshotFrom,
+  thousands,
   transcriptDigest,
   TRIGGER_WINDOW_SECONDS,
   TTL_SECONDS,
   turnHasEnded,
+  type AutoLoad,
   type HandoffMeta,
+  type InterceptInput,
   type ResolvedTtl,
   type Ttl,
   type TtlSource,
@@ -41,6 +48,14 @@ const HAIKU_DIGEST_CHARS = 400_000
 const HAIKU_MAX_TOKENS = 8_000
 const YES = 'Yes, clear and load it'
 const NO = 'No'
+const LOAD_ALWAYS = 'Yes, and load automatically from now on'
+const LOAD_ASK = 'Yes, and ask me each time'
+const LOAD = 'Yes, clear and send it after the handoff'
+const SEND_FULL = 'No, send it with the full context'
+const NEVER = 'No, and never intercept again'
+const SAVED: Record<string, AutoLoad> = { [LOAD_ALWAYS]: 'auto', [LOAD_ASK]: 'ask', [SEND_FULL]: 'ask', [NEVER]: 'off' }
+const AUTO_LOAD_KEY = 'cache-magic.autoLoad'
+const AUTO_LOAD_WHERE = '/config, row "Cache Magic: Auto-load"'
 
 type Timer = { cancel: () => void }
 type Idle = {
@@ -52,12 +67,21 @@ type Idle = {
   ttl: Ttl
   ttlSource: TtlSource
   claimed: boolean
+  // When the handoff fork read the cache, which restarts its clock.
+  forkReadAt?: number
   timer?: Timer
 }
+
+// A resumed session whose cache Claude Code reports cold: its first typed prompt is a late one.
+type Resumed = { sessionId: string; lastResponseAt: number; contextTokens: number }
+
+type ColdPrompt = { handoff: string; meta: HandoffMeta; contextTokens: number }
+
 type Generator = 'fork' | 'haiku'
 type Plan = { override: unknown; generator: Generator; timeoutMs: number }
 
 let idle: Idle | undefined
+let resumed: Resumed | undefined
 let activeTurn = false
 let generating = false
 
@@ -172,6 +196,7 @@ async function rotate($: EngineInterface, root: string) {
 }
 
 async function generate($: EngineInterface, current: Idle, contextSize: number, generator: Generator, timeoutMs: number) {
+  if (generator === 'fork') current.forkReadAt = await $.clock.now()
   const result = await requestHandoff($, generator, timeoutMs)
   if (result === TIMED_OUT) return logError($, `${generator} timed out after ${timeoutMs / 1000}s; no handoff written`)
   if (!result.isAnswered) {
@@ -263,16 +288,14 @@ async function turnEndedAt($: EngineInterface, e: { session_id: string; transcri
   }
 }
 
-async function offer($: EngineInterface, e: { source: string; session_id: string; prompt_cache_likely_expired?: boolean }) {
+async function offer($: EngineInterface, e: { session_id: string }) {
   const root = await $.session.root()
   const meta = parseMeta((await readText($, at(root, META))) ?? '')
   const offeredKey = `offered:${root}`
   const input = {
     meta,
     nowMs: await $.clock.now(),
-    source: e.source,
     sessionId: e.session_id,
-    cacheLikelyExpired: e.prompt_cache_likely_expired,
     offeredTimestamp: await $.store.get(offeredKey),
   }
   if (!shouldOffer(input)) return
@@ -282,8 +305,80 @@ async function offer($: EngineInterface, e: { source: string; session_id: string
   const answer = await $.ui.ask(offerQuestion(input.meta), { header: 'Handoff', options: [YES, NO] })
   if (answer !== YES) return
   // A fresh session has nothing to clear.
-  if (e.source === 'resume') await $.command.run({ command: 'clear' })
   await $.prompt.submit({ text: loadMessage(handoff) })
+}
+
+// The handoff to load in place of a prompt that would re-send a cold cache, or undefined to let it go.
+async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLoad): Promise<ColdPrompt | undefined> {
+  const nowMs = await $.clock.now()
+  let cache: InterceptInput['cache'] = 'unknown'
+  let sessionId: string | undefined
+  // The handoff must be newer than the session's last activity.
+  let quietSince = Infinity
+  let contextTokens = 0
+  if (idle) {
+    sessionId = idle.sessionId
+    quietSince = idle.stoppedAt
+    if (idle.ttlSource !== 'assumed') cache = nowMs >= cacheGoneAt(idle.stoppedAt, idle.forkReadAt, idle.ttl) ? 'cold' : 'warm'
+  } else if (resumed) {
+    sessionId = resumed.sessionId
+    quietSince = resumed.lastResponseAt
+    cache = 'cold'
+    contextTokens = resumed.contextTokens
+  }
+  const prompt = { origin: e.origin.kind, text: e.text, hasAttachments: (e.attachments ?? []).length > 0, duringTurn: activeTurn || e.turnId !== undefined }
+  // Files are read only for a prompt that would otherwise go cold.
+  let decision = decideIntercept({ mode, prompt, cache, contextTokens: Infinity, handoffCurrent: true })
+  let meta: HandoffMeta | undefined
+  let root = ''
+  if (decision.intercept) {
+    if (idle) contextTokens = (await $.session.usage()).context.tokens ?? 0
+    root = await $.session.root()
+    meta = parseMeta((await readText($, at(root, META))) ?? '')
+    const handoffCurrent = !!meta && meta.sessionId === sessionId && Date.parse(meta.timestamp) >= quietSince
+    decision = decideIntercept({ mode, prompt, cache, contextTokens, handoffCurrent })
+  }
+  if (!decision.intercept) {
+    if (decision.reason !== 'not-typed') $.ui.log(`cache-magic: prompt sent as typed, ${decision.reason}`, { to: 'debug' })
+    return undefined
+  }
+  const handoff = await readText($, at(root, HANDOFF))
+  return handoff === undefined || !meta ? undefined : { handoff, meta, contextTokens }
+}
+
+// Runs after the prompt was dropped and its hook returned.
+async function loadInstead($: EngineInterface, e: PromptSubmitInput, cold: ColdPrompt, mode: AutoLoad) {
+  idle?.timer?.cancel()
+  idle = undefined
+  resumed = undefined
+  let load = mode === 'auto'
+  let save: AutoLoad | undefined
+  if (!load) {
+    const options = mode === 'ask-once' ? [LOAD_ALWAYS, LOAD_ASK, SEND_FULL, NEVER] : [LOAD, SEND_FULL]
+    const answer = await $.ui.ask(coldPromptQuestion(cold.contextTokens, cold.meta.timestamp), { header: 'Cache Magic', options }).catch(() => undefined)
+    if (answer === undefined || !options.includes(answer)) {
+      // Dismissed, or answered under "Other": the prompt goes back in the box as typed.
+      await $.prompt.fill({ text: e.text })
+      return
+    }
+    load = answer === LOAD_ALWAYS || answer === LOAD_ASK || answer === LOAD
+    if (mode === 'ask-once') save = SAVED[answer]
+  }
+  if (load) {
+    await $.command.run({ command: 'clear' })
+    await $.prompt.submit({ text: loadMessage(cold.handoff, e.text) })
+    $.ui.log(
+      `cache-magic: the prompt cache had expired, so the session was cleared and your prompt sent after the handoff instead of re-sending ${thousands(cold.contextTokens)} tokens. /resume restores the full session. Auto-load is in ${AUTO_LOAD_WHERE}.`,
+    )
+  } else {
+    await $.prompt.submit({ text: e.text, asUser: true })
+  }
+  if (save) {
+    $.ui.toast(`Auto-load saved as "${save}". Change it in ${AUTO_LOAD_WHERE}.`, { timeoutMs: 10_000 })
+    // Saving reloads the module, so it comes last.
+    const saved = await $.config.set({ key: AUTO_LOAD_KEY, value: save })
+    if ('deny' in saved && saved.deny) await logError($, `could not save Auto-load as ${save}: ${saved.deny}`)
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -292,13 +387,26 @@ export const register: Register = (on, options) => {
   const generator: Generator = options.generator === 'haiku' ? 'haiku' : 'fork'
   const seconds = typeof options.timeoutSeconds === 'number' && options.timeoutSeconds > 0 ? options.timeoutSeconds : DEFAULT_TIMEOUT_SECONDS
   const timeoutMs = Math.round(seconds * 1000)
+  const autoLoad = parseAutoLoad(options.autoLoad)
   // Bookkeeping only: the turn flag and timer are set here, and every model call waits for the turn to end.
   on('turn.start', async ($, e, next) => {
     activeTurn = true
     idle?.timer?.cancel()
     idle = undefined
+    resumed = undefined
     return next(e)
   })
+
+  on('prompt.submit', async ($, e, next) => {
+    const cold = await coldPrompt($, e, autoLoad)
+    if (!cold) return next(e)
+    // `/clear` refuses to run while this hook holds the prompt, so the work starts once it has returned.
+    $.clock.after(0, () => {
+      void loadInstead($, e, cold, autoLoad).catch(error => logError($, `auto-load failed: ${error instanceof Error ? error.message : String(error)}`))
+    })
+    const then = autoLoad === 'auto' ? 'Loading the handoff instead.' : 'Choose how to send this prompt.'
+    return { drop: `Cache Magic: the prompt cache has expired. ${then}` }
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   const plan: Plan = { override: options.cacheTtlOverride, generator, timeoutMs }
 
@@ -315,7 +423,17 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('classic.SessionStart', { source: ['startup', 'resume'] }, async ($, e, next) => {
-    void offer($, e).catch(error => logError($, `offer failed: ${error instanceof Error ? error.message : String(error)}`))
+    if (e.source === 'startup') {
+      void offer($, e).catch(error => logError($, `offer failed: ${error instanceof Error ? error.message : String(error)}`))
+    } else {
+      idle?.timer?.cancel()
+      idle = undefined
+      resumed = undefined
+      if (e.prompt_cache_likely_expired === true) {
+        const lastResponseAt = (await $.clock.now()) - (e.seconds_since_last_response ?? 0) * 1000
+        resumed = { sessionId: e.session_id, lastResponseAt, contextTokens: e.context_tokens ?? 0 }
+      }
+    }
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 

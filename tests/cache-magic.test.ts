@@ -1,13 +1,15 @@
 import type { On, SessionMessage } from 'claude-code'
-import { describe, expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import {
   decide,
+  decideIntercept,
   filesModified,
   lastRealRowAt,
   missingSections,
   observeCache,
   offerQuestion,
+  parseAutoLoad,
   parseMeta,
   resolveTtl,
   SECTIONS,
@@ -16,6 +18,7 @@ import {
   turnHasEnded,
   type CacheSnapshot,
   type HandoffMeta,
+  type PromptFacts,
 } from '../hooks/logic'
 
 const ROOT = '/work/project'
@@ -53,8 +56,11 @@ type World = {
   forks: string[]
   completions: number
   submitted: string[]
+  submittedAsUser: string[]
   commands: string[]
   asked: string[]
+  filled: string[]
+  saved: { key: string; value: unknown }[]
 }
 
 // Answers every call the mod makes beneath it, from memory.
@@ -68,7 +74,17 @@ type Setup = {
 }
 
 function world(on: On, setup: Setup = {}): World {
-  const state: World = { files: new Map(Object.entries(setup.files ?? {})), forks: [], completions: 0, submitted: [], commands: [], asked: [] }
+  const state: World = {
+    files: new Map(Object.entries(setup.files ?? {})),
+    forks: [],
+    completions: 0,
+    submitted: [],
+    submittedAsUser: [],
+    commands: [],
+    asked: [],
+    filled: [],
+    saved: [],
+  }
   mock.store(on)
   mock.env(on, {})
   on('classic.Stop', () => ({}))
@@ -122,11 +138,24 @@ function world(on: On, setup: Setup = {}): World {
     return {}
   })
   on('prompt.submit', ($, e) => {
-    state.submitted.push(e.text)
+    if (e.origin.kind !== 'composer') state.submitted.push(e.text)
+    if ((e as { asUser?: true }).asUser || (e.origin as { asUser?: boolean }).asUser) state.submittedAsUser.push(e.text)
     return { text: e.text }
   })
+  on('prompt.fill', ($, e) => {
+    state.filled.push(e.text)
+    return { isFilled: true }
+  })
+  on('config.set', ($, e) => {
+    state.saved.push({ key: e.key, value: e.value })
+    return { value: e.value }
+  })
+  on('ui.toast', () => ({ value: undefined }))
   return state
 }
+
+// A prompt the user typed and sent with Enter.
+const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' as const } })
 
 const stop = { stop_hook_active: false, last_assistant_message: 'Done.', transcript_path: '', session_id: 'session-a' } as const
 
@@ -396,13 +425,13 @@ describe('session start', () => {
     expect(state.submitted[0]).toContain('## Failed attempts')
   })
 
-  test('clears a resumed session whose cache went cold before loading its handoff', ENABLED, async ($, on) => {
+  test('a resumed session is not asked at start: its first prompt is what auto-load intercepts', ENABLED, async ($, on) => {
     const clock = mock.clock(on, { now: T0 })
     const state = world(on, { files: files(), answer: 'Yes, clear and load it' })
     await $.classic.SessionStart({ source: 'resume', session_id: 'session-a', prompt_cache_likely_expired: true })
     await clock.settle()
-    expect(state.commands).toEqual(['clear'])
-    expect(state.submitted).toHaveLength(1)
+    expect(state.asked).toEqual([])
+    expect(state.submitted).toEqual([])
   })
 
   test('declining leaves the session alone', ENABLED, async ($, on) => {
@@ -414,15 +443,140 @@ describe('session start', () => {
     expect(state.submitted).toEqual([])
   })
 
-  test('offer rules: within 24h, once per handoff, and a resume only when its own cache is cold', () => {
-    const base = { meta: meta(), nowMs: T0, source: 'startup', sessionId: 'session-b' }
+  test('offer rules: another session, within 24h, once per handoff', () => {
+    const base = { meta: meta(), nowMs: T0, sessionId: 'session-b' }
     expect(shouldOffer(base)).toBe(true)
     expect(shouldOffer({ ...base, nowMs: T0 + 25 * 3_600_000 })).toBe(false)
     expect(shouldOffer({ ...base, offeredTimestamp: meta().timestamp })).toBe(false)
     expect(shouldOffer({ ...base, meta: undefined })).toBe(false)
-    expect(shouldOffer({ ...base, source: 'resume', sessionId: 'session-a', cacheLikelyExpired: false })).toBe(false)
-    expect(shouldOffer({ ...base, source: 'resume', sessionId: 'session-a', cacheLikelyExpired: true })).toBe(true)
-    expect(shouldOffer({ ...base, source: 'resume', sessionId: 'session-c', cacheLikelyExpired: true })).toBe(false)
+    expect(shouldOffer({ ...base, sessionId: 'session-a' })).toBe(false)
     expect(offerQuestion(meta({ filesModified: 1 }))).toContain('1 file was modified')
+  })
+})
+
+describe('auto-load', () => {
+  const AUTO = { options: { enabled: true, autoLoad: 'auto' } }
+  const ASK = { options: { enabled: true, autoLoad: 'ask' } }
+  const PLAIN = { mode: 'auto', cache: 'cold', contextTokens: 900_000, handoffCurrent: true } as const
+  const prompt = (overrides: Partial<PromptFacts> = {}): PromptFacts => ({ origin: 'composer', text: 'Now run the tests', hasAttachments: false, duringTurn: false, ...overrides })
+
+  // A 5m session that went idle at T0 and had its handoff forked 30 seconds before expiry. The fork's
+  // read restarts the cache's clock, so the cache is gone at T0 + 269s + 300s.
+  async function idleUntil($: Engine, on: On, setup: Setup, nowFromT0: number) {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { ...setup, files: { [TRANSCRIPT]: turn(T0 - 1_000, 300, 0), ...setup.files } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(269_000)
+    expect(state.forks).toHaveLength(1)
+    await clock.advance(nowFromT0 - 269_000)
+    return { clock, state }
+  }
+
+  test('auto: a prompt after the cache expired clears the session and is sent after the handoff', AUTO, async ($, on) => {
+    const { clock, state } = await idleUntil($, on, {}, 600_000)
+    const result = await $.prompt.submit(typed('Now run the tests'))
+    expect(result.drop).toContain('the prompt cache has expired')
+    await clock.settle()
+    expect(state.commands).toEqual(['clear'])
+    expect(state.submitted).toHaveLength(1)
+    expect(state.submitted[0]).toContain('## Failed attempts')
+    expect(state.submitted[0]!.endsWith('My message:\n\nNow run the tests')).toBe(true)
+    expect(state.asked).toEqual([])
+    expect(state.saved).toEqual([])
+  })
+
+  test('a prompt while the fork has kept the cache warm goes as typed', AUTO, async ($, on) => {
+    const { clock, state } = await idleUntil($, on, {}, 568_000)
+    const result = await $.prompt.submit(typed('Now run the tests'))
+    expect(result.drop).toBeUndefined()
+    await clock.settle()
+    expect(state.commands).toEqual([])
+  })
+
+  test('ask-once: the first answer loads the handoff and saves auto in /config', ENABLED, async ($, on) => {
+    const { clock, state } = await idleUntil($, on, { answer: 'Yes, and load automatically from now on' }, 600_000)
+    await $.prompt.submit(typed('Now run the tests'))
+    await clock.settle()
+    expect(state.asked[0]).toContain('The prompt cache has expired, so this prompt would re-send 900k tokens at full price.')
+    expect(state.asked[0]).toContain('No, and never intercept again')
+    expect(state.commands).toEqual(['clear'])
+    expect(state.submitted[0]).toContain('Now run the tests')
+    expect(state.saved).toEqual([{ key: 'cache-magic.autoLoad', value: 'auto' }])
+  })
+
+  test('ask-once: sending the full context resends the prompt as typed and saves ask', ENABLED, async ($, on) => {
+    const { clock, state } = await idleUntil($, on, { answer: 'No, send it with the full context' }, 600_000)
+    await $.prompt.submit(typed('Now run the tests'))
+    await clock.settle()
+    expect(state.commands).toEqual([])
+    expect(state.submittedAsUser).toEqual(['Now run the tests'])
+    expect(state.saved).toEqual([{ key: 'cache-magic.autoLoad', value: 'ask' }])
+  })
+
+  test('ask: asks each time without saving, and a dismissed question puts the prompt back in the box', ASK, async ($, on) => {
+    const { clock, state } = await idleUntil($, on, { answer: 'something typed under Other' }, 600_000)
+    await $.prompt.submit(typed('Now run the tests'))
+    await clock.settle()
+    expect(state.asked[0]).toContain('Yes, clear and send it after the handoff')
+    expect(state.asked[0]).not.toContain('never intercept')
+    expect(state.filled).toEqual(['Now run the tests'])
+    expect(state.commands).toEqual([])
+    expect(state.submitted).toEqual([])
+    expect(state.saved).toEqual([])
+  })
+
+  test('a TTL that is only assumed never intercepts', AUTO, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.classic.Stop(stop)
+    await clock.advance(2 * 3_600_000)
+    const result = await $.prompt.submit(typed('Now run the tests'))
+    expect(result.drop).toBeUndefined()
+    expect(state.commands).toEqual([])
+  })
+
+  test('a resumed session Claude Code reports cold loads its own handoff on the first prompt', AUTO, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, {
+      files: { [`${ROOT}/.claude/handoff.meta.json`]: JSON.stringify(meta()), [`${ROOT}/.claude/handoff.md`]: HANDOFF_BODY },
+    })
+    const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
+    await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: true })
+    expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeDefined()
+    await clock.settle()
+    expect(state.commands).toEqual(['clear'])
+    expect(state.submitted[0]).toContain('Where were we?')
+  })
+
+  test('a resumed session with a warm cache, or another session\'s handoff, goes as typed', AUTO, async ($, on) => {
+    mock.clock(on, { now: T0 })
+    world(on, { files: { [`${ROOT}/.claude/handoff.meta.json`]: JSON.stringify(meta({ sessionId: 'session-z' })), [`${ROOT}/.claude/handoff.md`]: HANDOFF_BODY } })
+    const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
+    await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: false })
+    expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeUndefined()
+    await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: true })
+    expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeUndefined()
+  })
+
+  test('intercepts only a plain typed prompt on a cold, large session with a current handoff', () => {
+    expect(decideIntercept({ ...PLAIN, prompt: prompt() })).toEqual({ intercept: true })
+    expect(decideIntercept({ ...PLAIN, mode: 'off', prompt: prompt() })).toEqual({ intercept: false, reason: 'off' })
+    expect(decideIntercept({ ...PLAIN, prompt: prompt({ origin: 'plugin' }) })).toEqual({ intercept: false, reason: 'not-typed' })
+    expect(decideIntercept({ ...PLAIN, prompt: prompt({ duringTurn: true }) })).toEqual({ intercept: false, reason: 'not-typed' })
+    for (const text of ['/compact', '!ls', 'look at @src/login.ts', '   ']) {
+      expect(decideIntercept({ ...PLAIN, prompt: prompt({ text }) })).toEqual({ intercept: false, reason: 'not-plain' })
+    }
+    expect(decideIntercept({ ...PLAIN, prompt: prompt({ hasAttachments: true }) })).toEqual({ intercept: false, reason: 'not-plain' })
+    expect(decideIntercept({ ...PLAIN, prompt: prompt({ text: 'mail me at a@b.c' }) })).toEqual({ intercept: true })
+    expect(decideIntercept({ ...PLAIN, cache: 'warm', prompt: prompt() })).toEqual({ intercept: false, reason: 'warm' })
+    expect(decideIntercept({ ...PLAIN, cache: 'unknown', prompt: prompt() })).toEqual({ intercept: false, reason: 'ttl-unknown' })
+    expect(decideIntercept({ ...PLAIN, contextTokens: 49_999, prompt: prompt() })).toEqual({ intercept: false, reason: 'context-small' })
+    expect(decideIntercept({ ...PLAIN, handoffCurrent: false, prompt: prompt() })).toEqual({ intercept: false, reason: 'no-handoff' })
+  })
+
+  test('reads Auto-load from config, falling back to ask-once', () => {
+    expect(parseAutoLoad('auto')).toBe('auto')
+    expect(parseAutoLoad('bogus')).toBe('ask-once')
+    expect(parseAutoLoad(undefined)).toBe('ask-once')
   })
 })

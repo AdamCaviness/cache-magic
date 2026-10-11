@@ -2,7 +2,7 @@
   "name": "cache-magic",
   "displayName": "Cache Magic",
   "version": "0.1.1",
-  "description": "Writes a structured handoff while a large session's prompt cache is still warm, then offers to load it once the cache has gone cold",
+  "description": "Writes a structured handoff while a large session's prompt cache is still warm, then sends a prompt that arrives after it expired with the handoff instead of the full context",
   "author": {
     "name": "Adam Caviness"
   },
@@ -18,8 +18,15 @@
     "enabled": {
       "type": "boolean",
       "title": "Cache Magic: Enabled",
-      "description": "Turns Cache Magic on. Off by default: when on, an idle session over 50k tokens spends one model call writing .claude/handoff.md just before its prompt cache expires",
+      "description": "Turns Cache Magic on. Off by default: when on, an idle session over 50k tokens spends one model call writing .claude/handoff.md just before its prompt cache expires, and a prompt sent after it expired can be sent after the handoff instead",
       "default": false
+    },
+    "autoLoad": {
+      "type": "string",
+      "title": "Cache Magic: Auto-load",
+      "description": "What happens to a prompt you send after the prompt cache expired, when a handoff is ready. ask-once (default): ask the first time and save your answer here as auto or ask. auto: clear the session and send the prompt after the handoff. ask: ask each time. off: send it with the full context",
+      "default": "ask-once",
+      "options": ["ask-once", "auto", "ask", "off"]
     },
     "cacheTtlOverride": {
       "type": "string",

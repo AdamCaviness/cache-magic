@@ -272,21 +272,18 @@ export function renderHandoff(body: string, meta: HandoffMeta): string {
 export type OfferInput = {
   meta: HandoffMeta | undefined
   nowMs: number
-  source: string
   sessionId: string
-  cacheLikelyExpired?: boolean
   offeredTimestamp?: unknown
 }
 
+// A new session is offered an earlier session's handoff. A resumed session's
+// own handoff waits for its first prompt, which auto-load intercepts.
 export function shouldOffer(input: OfferInput): input is OfferInput & { meta: HandoffMeta } {
   const meta = input.meta
   if (!meta || input.offeredTimestamp === meta.timestamp) return false
   const ageMs = input.nowMs - Date.parse(meta.timestamp)
   if (!(ageMs >= 0 && ageMs < OFFER_WINDOW_MS)) return false
-  if (input.source === 'startup') return meta.sessionId !== input.sessionId
-  // A resumed session only benefits when it is the one the handoff describes and its cache went cold.
-  if (input.source === 'resume') return meta.sessionId === input.sessionId && input.cacheLikelyExpired !== false
-  return false
+  return meta.sessionId !== input.sessionId
 }
 
 export function formatTimestamp(iso: string): string {
@@ -298,13 +295,87 @@ export function offerQuestion(meta: HandoffMeta): string {
   return `A handoff from ${formatTimestamp(meta.timestamp)} is available. ${files} modified. Clear this session and load it?`
 }
 
-export function loadMessage(handoff: string): string {
+export function loadMessage(handoff: string, prompt?: string): string {
+  if (prompt === undefined) {
+    return [
+      'Continue from this handoff, written by the previous session before its prompt cache expired.',
+      'Read it, do not retry anything under "Failed attempts", and wait for my go-ahead before starting the next step.',
+      '',
+      handoff.trim(),
+    ].join('\n')
+  }
   return [
-    'Continue from this handoff, written by the previous session before its prompt cache expired.',
-    'Read it, do not retry anything under "Failed attempts", and wait for my go-ahead before starting the next step.',
+    'Continue from this handoff, written by this session before its prompt cache expired.',
+    'Read it, do not retry anything under "Failed attempts", then answer my message after it.',
     '',
     handoff.trim(),
+    '',
+    '---',
+    '',
+    'My message:',
+    '',
+    prompt,
   ].join('\n')
+}
+
+// `ask-once` asks at the first cold prompt and saves the answer as `auto` or `ask`.
+export const AUTO_LOAD_MODES = ['ask-once', 'auto', 'ask', 'off'] as const
+
+export type AutoLoad = (typeof AUTO_LOAD_MODES)[number]
+
+export function parseAutoLoad(value: unknown): AutoLoad {
+  return AUTO_LOAD_MODES.find(mode => mode === value) ?? 'ask-once'
+}
+
+export type PromptFacts = {
+  origin: string
+  text: string
+  hasAttachments: boolean
+  duringTurn: boolean
+}
+
+export type InterceptInput = {
+  mode: AutoLoad
+  prompt: PromptFacts
+  // `unknown` when the TTL is only assumed: a guess must not throw away a warm cache.
+  cache: 'cold' | 'warm' | 'unknown'
+  contextTokens: number
+  handoffCurrent: boolean
+}
+
+export type InterceptReason = 'off' | 'not-typed' | 'not-plain' | 'warm' | 'ttl-unknown' | 'context-small' | 'no-handoff'
+
+export type InterceptDecision = { intercept: true } | { intercept: false; reason: InterceptReason }
+
+// A plugin's prompt expands neither images nor @-mentions, so a prompt with
+// either is left to go as typed.
+export function decideIntercept(input: InterceptInput): InterceptDecision {
+  const pass = (reason: InterceptReason): InterceptDecision => ({ intercept: false, reason })
+  if (input.mode === 'off') return pass('off')
+  const { prompt } = input
+  if (prompt.origin !== 'composer' || prompt.duringTurn) return pass('not-typed')
+  const text = prompt.text.trim()
+  if (!text || prompt.hasAttachments || /^[/!]/.test(text) || /(^|\s)@\S/.test(text)) return pass('not-plain')
+  if (input.cache === 'warm') return pass('warm')
+  if (input.cache === 'unknown') return pass('ttl-unknown')
+  if (input.contextTokens < MIN_CONTEXT_TOKENS) return pass('context-small')
+  if (!input.handoffCurrent) return pass('no-handoff')
+  return { intercept: true }
+}
+
+// When the cache is surely gone: one TTL after it was last read. The Stop
+// comes after the turn's last request, so it errs toward warm; a handoff fork
+// reads the cache again and restarts its clock.
+export function cacheGoneAt(stoppedAt: number, forkReadAt: number | undefined, ttl: Ttl): number {
+  return Math.max(stoppedAt, forkReadAt ?? 0) + TTL_SECONDS[ttl] * 1000
+}
+
+export function thousands(tokens: number): string {
+  return `${Math.round(tokens / 1000)}k`
+}
+
+export function coldPromptQuestion(contextTokens: number, handoffAt: string): string {
+  return `The prompt cache has expired, so this prompt would re-send ${thousands(contextTokens)} tokens at full price. Clear the session and send it after the handoff from ${formatTimestamp(handoffAt)}?`
 }
 
 // Text of the newest messages that fit in maxChars, with the opening request
