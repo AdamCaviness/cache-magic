@@ -1,7 +1,7 @@
 {
   "name": "cache-handoff",
   "displayName": "Cache Handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Writes a structured handoff while a large session's prompt cache is still warm, then offers to load it once the cache has gone cold",
   "author": {
     "name": "Adam Caviness"
