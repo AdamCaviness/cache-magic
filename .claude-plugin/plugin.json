@@ -1,7 +1,7 @@
 {
   "name": "cache-magic",
   "displayName": "Cache Magic",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Writes a structured handoff while a large session's prompt cache is still warm, then sends a prompt that arrives after it expired with the handoff instead of the full context",
   "author": {
     "name": "Adam Caviness"
