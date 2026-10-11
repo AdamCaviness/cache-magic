@@ -1,8 +1,10 @@
 # Cache Magic
 
-A Claude Code mod for one quota problem: a large session that sits idle past its prompt cache TTL. The next prompt, however small, re-sends the whole context at full input price. On a 900k-token session that can cost 15 to 20% of a 5-hour usage window ([anthropics/claude-code#51218](https://github.com/anthropics/claude-code/issues/51218)).
+A Claude Code mod offering a different approach to Anthropic's built-in automatic idle compaction for a large session that sits idle past its prompt cache TTL. If you don't use built-in idle compaction and otherwise do nothing about prompt cache expiration, your next prompt, however small, re-sends the whole context at full input price. Imagine a session you let get out of hand at 900k-tokens; that could cost 15 to 20% of a 5-hour usage window ([anthropics/claude-code#51218](https://github.com/anthropics/claude-code/issues/51218)).
 
-The cheap moment is while the cache is still warm. About 30 seconds before it expires, Cache Magic spends one cache read writing a handoff to `.claude/cache-magic/handoff.md`. What goes in it is yours to pick: your instructions quoted, decisions and failed attempts, files and git status, the next step. The first large turn asks, in the answers row above the prompt, and the choice is kept.
+The right time to address this is while the cache is still warm but we usually don't know when we'll have to step away and things will just automatically go cold (why Anthropic release idleCompaction). 
+
+About 30 seconds before it expires, cache-magic spends one cache _read_ constructing a handoff to `.claude/cache-magic/handoff.md`. What goes in it is yours to pick: your instructions quoted, decisions and failed attempts, files and git status, the next step (this is what it's doing differently than the built-in idle compaction). Then when you go to continue working this mod will ask you if you want to use the smaller handoff (and if you want to always do that).
 
 What happens when you come back depends on the cache:
 
