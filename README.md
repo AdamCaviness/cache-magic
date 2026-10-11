@@ -2,7 +2,7 @@
 
 A Claude Code mod for one quota problem: a large session that sits idle past its prompt cache TTL. The next prompt, however small, re-sends the whole context at full input price. On a 900k-token session that can cost 15 to 20% of a 5-hour usage window ([anthropics/claude-code#51218](https://github.com/anthropics/claude-code/issues/51218)).
 
-Cache Magic handles both sides of that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/handoff.md`. When you come back and send a prompt after the cache has expired, it catches the prompt before it goes out, clears the session, and sends your prompt after the handoff instead of the full context. The first time, it asks whether to do that automatically from then on or to ask each time.
+Cache Magic handles both sides of that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/cache-magic/handoff.md`. When you come back and send a prompt after the cache has expired, it catches the prompt before it goes out, clears the session, and sends your prompt after the handoff instead of the full context. The first time, it asks whether to do that automatically from then on or to ask each time.
 
 It does nothing in sessions under 50k tokens. The first new session after install shows one line saying what it does and where its settings are.
 
@@ -56,12 +56,12 @@ Every setting is a row in `/config` starting with "Cache Magic". The same settin
 
 | File | Contents |
 | --- | --- |
-| `.claude/handoff.md` | The latest handoff |
-| `.claude/handoff.1.md` to `.claude/handoff.3.md` | The three before it, newest first. Each opens with a comment giving its generation time. |
-| `.claude/handoff.meta.json` | `{ timestamp, sessionId, cacheTtl, contextSize, filesModified, turns }` |
-| `.claude/handoff-error.log` | Failures and timeouts, keeping the last 200 lines |
+| `.claude/cache-magic/handoff.md` | The latest handoff |
+| `.claude/cache-magic/handoff.1.md` to `.claude/cache-magic/handoff.3.md` | The three before it, newest first. Each opens with a comment giving its generation time. |
+| `.claude/cache-magic/handoff.meta.json` | `{ timestamp, sessionId, cacheTtl, contextSize, filesModified, turns }` |
+| `.claude/cache-magic/handoff-error.log` | Failures and timeouts, keeping the last 200 lines |
 
-You may want `.claude/handoff*` in your `.gitignore`.
+The folder holds a `.gitignore` of `*`, so none of it is committed and your own `.gitignore` needs nothing.
 
 ## Auto-load
 
@@ -71,7 +71,7 @@ You may want `.claude/handoff*` in your `.gitignore`.
 - It is plain text: not a `/` command or `!` shell line, with no image and no `@` mention. A prompt the mod sends on your behalf can't carry those, so the mod leaves them alone.
 - The cache is surely gone: one TTL after the later of the turn's `Stop` and the handoff fork, which reads the cache and restarts its clock. If the TTL is only assumed (the transcript showed none and nothing is configured), the mod never intercepts, so it can't throw away a warm cache on a guess.
 - The context is at least 50k tokens.
-- `.claude/handoff.md` is this session's, written after its last turn.
+- `.claude/cache-magic/handoff.md` is this session's, written after its last turn.
 
 For a resumed session, Claude Code reports at startup whether the cache likely expired. If it did, the session's first typed prompt is a late one and gets the same treatment.
 
@@ -90,7 +90,7 @@ Loading runs `/clear`, then sends one message: the handoff, then your prompt und
 
 ## New sessions
 
-**On a new session** (`startup`), if `.claude/handoff.meta.json` is under 24 hours old and from another session, the mod asks:
+**On a new session** (`startup`), if `.claude/cache-magic/handoff.meta.json` is under 24 hours old and from another session, the mod asks:
 
 > A handoff from 2026-10-10 19:50 UTC is available. 2 files were modified. Clear this session and load it?
 

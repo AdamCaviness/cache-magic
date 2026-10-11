@@ -284,10 +284,11 @@ describe('handoff generation', () => {
     expect(state.forks).toHaveLength(1)
     expect(state.forks[0]).toContain('## Failed attempts')
     expect(state.forks[0]).toContain('M src/login.test.ts')
-    const handoff = state.files.get(`${ROOT}/.claude/handoff.md`)
+    const handoff = state.files.get(`${ROOT}/.claude/cache-magic/handoff.md`)
     expect(handoff).toContain('# Handoff')
     expect(handoff).toContain('session session-a')
-    const written = parseMeta(state.files.get(`${ROOT}/.claude/handoff.meta.json`)!)
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/.gitignore`)).toBe('*\n')
+    const written = parseMeta(state.files.get(`${ROOT}/.claude/cache-magic/handoff.meta.json`)!)
     expect(written).toEqual({ timestamp: new Date(T0 + 270_000).toISOString(), sessionId: 'session-a', cacheTtl: '5m', contextSize: 900_000, filesModified: 2, turns: 7 })
   })
 
@@ -313,7 +314,7 @@ describe('handoff generation', () => {
     expect(state.forks).toHaveLength(0)
     await clock.advance(1_000)
     expect(state.forks).toHaveLength(1)
-    expect(parseMeta(state.files.get(`${ROOT}/.claude/handoff.meta.json`)!)?.cacheTtl).toBe('1h')
+    expect(parseMeta(state.files.get(`${ROOT}/.claude/cache-magic/handoff.meta.json`)!)?.cacheTtl).toBe('1h')
   })
 
   test('the observed TTL wins over the override', { options: { enabled: true, cacheTtlOverride: '1h' } }, async ($, on) => {
@@ -338,17 +339,17 @@ describe('handoff generation', () => {
     const clock = mock.clock(on, { now: T0 })
     const state = world(on, {
       files: {
-        [`${ROOT}/.claude/handoff.md`]: 'current',
-        [`${ROOT}/.claude/handoff.1.md`]: 'one',
-        [`${ROOT}/.claude/handoff.2.md`]: 'two',
-        [`${ROOT}/.claude/handoff.3.md`]: 'three',
+        [`${ROOT}/.claude/cache-magic/handoff.md`]: 'current',
+        [`${ROOT}/.claude/cache-magic/handoff.1.md`]: 'one',
+        [`${ROOT}/.claude/cache-magic/handoff.2.md`]: 'two',
+        [`${ROOT}/.claude/cache-magic/handoff.3.md`]: 'three',
       },
     })
     await $.classic.Stop(stop)
     await clock.advance(270_000)
-    expect(state.files.get(`${ROOT}/.claude/handoff.1.md`)).toBe('current')
-    expect(state.files.get(`${ROOT}/.claude/handoff.2.md`)).toBe('one')
-    expect(state.files.get(`${ROOT}/.claude/handoff.3.md`)).toBe('two')
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff.1.md`)).toBe('current')
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff.2.md`)).toBe('one')
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff.3.md`)).toBe('two')
   })
 
   test('the haiku generator sends a transcript digest to Haiku instead of forking', { options: { enabled: true, generator: 'haiku' } }, async ($, on) => {
@@ -358,7 +359,7 @@ describe('handoff generation', () => {
     await clock.advance(270_000)
     expect(state.forks).toHaveLength(0)
     expect(state.completions).toBe(1)
-    expect(state.files.get(`${ROOT}/.claude/handoff.md`)).toContain('# Handoff')
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff.md`)).toContain('# Handoff')
   })
 
   test('a fork that outlasts the timeout logs to handoff-error.log and writes nothing', { options: { enabled: true, timeoutSeconds: 10 } }, async ($, on) => {
@@ -367,8 +368,8 @@ describe('handoff generation', () => {
     await $.classic.Stop(stop)
     await clock.advance(270_000)
     await clock.advance(10_000)
-    expect(state.files.has(`${ROOT}/.claude/handoff.md`)).toBe(false)
-    expect(state.files.get(`${ROOT}/.claude/handoff-error.log`)).toContain('fork timed out after 10s')
+    expect(state.files.has(`${ROOT}/.claude/cache-magic/handoff.md`)).toBe(false)
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff-error.log`)).toContain('fork timed out after 10s')
   })
 
   test('skips a context under 50k tokens', ENABLED, async ($, on) => {
@@ -416,8 +417,8 @@ describe('handoff generation', () => {
 
 describe('session start', () => {
   const files = (overrides: Partial<HandoffMeta> = {}) => ({
-    [`${ROOT}/.claude/handoff.meta.json`]: JSON.stringify(meta(overrides)),
-    [`${ROOT}/.claude/handoff.md`]: HANDOFF_BODY,
+    [`${ROOT}/.claude/cache-magic/handoff.meta.json`]: JSON.stringify(meta(overrides)),
+    [`${ROOT}/.claude/cache-magic/handoff.md`]: HANDOFF_BODY,
   })
 
   test('offers a fresh handoff from another session and loads it into a new one', ENABLED, async ($, on) => {
@@ -445,7 +446,7 @@ describe('session start', () => {
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-a' })
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-b' })
     await clock.settle()
-    expect(state.logs.filter(text => text.startsWith('Cache Magic is on.'))).toHaveLength(1)
+    expect(state.logs.filter(text => text.startsWith('When a session over 50k tokens sits idle, Cache Magic'))).toHaveLength(1)
     expect(state.logs[0]).toContain('/config, rows starting "Cache Magic"')
   })
 
@@ -454,7 +455,7 @@ describe('session start', () => {
     const state = world(on)
     await $.classic.SessionStart({ source: 'startup', session_id: 'session-a' })
     await clock.settle()
-    expect(state.logs[0]).toStartWith('Cache Magic is on.')
+    expect(state.logs[0]).toStartWith('When a session over 50k tokens sits idle, Cache Magic')
   })
 
   test('declining leaves the session alone', ENABLED, async ($, on) => {
@@ -561,7 +562,7 @@ describe('auto-load', () => {
   test('a resumed session Claude Code reports cold loads its own handoff on the first prompt', AUTO, async ($, on) => {
     const clock = mock.clock(on, { now: T0 })
     const state = world(on, {
-      files: { [`${ROOT}/.claude/handoff.meta.json`]: JSON.stringify(meta()), [`${ROOT}/.claude/handoff.md`]: HANDOFF_BODY },
+      files: { [`${ROOT}/.claude/cache-magic/handoff.meta.json`]: JSON.stringify(meta()), [`${ROOT}/.claude/cache-magic/handoff.md`]: HANDOFF_BODY },
     })
     const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
     await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: true })
@@ -573,7 +574,7 @@ describe('auto-load', () => {
 
   test('a resumed session with a warm cache, or another session\'s handoff, goes as typed', AUTO, async ($, on) => {
     mock.clock(on, { now: T0 })
-    world(on, { files: { [`${ROOT}/.claude/handoff.meta.json`]: JSON.stringify(meta({ sessionId: 'session-z' })), [`${ROOT}/.claude/handoff.md`]: HANDOFF_BODY } })
+    world(on, { files: { [`${ROOT}/.claude/cache-magic/handoff.meta.json`]: JSON.stringify(meta({ sessionId: 'session-z' })), [`${ROOT}/.claude/cache-magic/handoff.md`]: HANDOFF_BODY } })
     const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
     await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: false })
     expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeUndefined()
