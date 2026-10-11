@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/AdamCaviness/cache-magic/compare/v0.4.0...v0.4.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* improve clarity and consistency in README content ([#13](https://github.com/AdamCaviness/cache-magic/issues/13)) ([f74797e](https://github.com/AdamCaviness/cache-magic/commit/f74797e548509cb310ed88a08fe4c026fb1d5277))
+
 ## [0.4.0](https://github.com/AdamCaviness/cache-magic/compare/v0.3.0...v0.4.0) (2026-10-11)
 
 

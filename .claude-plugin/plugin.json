@@ -1,7 +1,7 @@
 {
   "name": "cache-magic",
   "displayName": "Cache Magic",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Keeps a handoff while a large session's prompt cache is still warm. On a five-minute cache, a late prompt can go out after the handoff instead of the full context. On a one-hour cache the session stays, and compaction is pointed at the handoff.",
   "author": {
     "name": "Adam Caviness"
