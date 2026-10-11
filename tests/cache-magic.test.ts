@@ -2,20 +2,31 @@ import type { On, SessionMessage } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import {
+  clearsOnColdPrompt,
   decide,
   decideIntercept,
   filesModified,
+  handoffPrompt,
+  keepFromAnswer,
+  KEEP_QUESTION,
   lastRealRowAt,
   missingSections,
   observeCache,
   offerQuestion,
   parseAutoLoad,
+  parseKeep,
   parseMeta,
+  quotedInstructions,
   resolveTtl,
   SECTIONS,
   shouldOffer,
+  shouldWriteBeforeCompact,
   snapshotFrom,
   turnHasEnded,
+  withQuotes,
+  WRITER_HAIKU,
+  WRITER_QUESTION,
+  writerFromAnswer,
   type CacheSnapshot,
   type HandoffMeta,
   type PromptFacts,
@@ -62,6 +73,8 @@ type World = {
   filled: string[]
   saved: { key: string; value: unknown }[]
   logs: string[]
+  compactNotes: string[]
+  completionPrompts: string[]
 }
 
 // Answers every call the mod makes beneath it, from memory.
@@ -70,6 +83,9 @@ type Setup = {
   tokens?: number
   draft?: string
   answer?: string
+  answerFor?: (question: string) => string
+  askPrefs?: boolean
+  settings?: Record<string, unknown>
   fork?: 'answer' | 'hang'
   transcriptMtimeMs?: number
 }
@@ -86,13 +102,21 @@ function world(on: On, setup: Setup = {}): World {
     filled: [],
     saved: [],
     logs: [],
+    compactNotes: [],
+    completionPrompts: [],
   }
-  mock.store(on)
+  mock.store(on, setup.askPrefs ? {} : { prefsAsked: true })
   mock.env(on, {})
   on('classic.Stop', () => ({}))
   on('classic.SessionStart', () => ({}))
-  on('settings.read', () => ({ value: {} }))
+  on('session.start', () => ({ cwd: ROOT }))
+  on('session.compact', ($, e) => {
+    state.compactNotes.push(e.instructions ?? '')
+    return { messages: e.messages }
+  })
+  on('settings.read', () => ({ value: setup.settings ?? {} }))
   on('session.root', () => ({ value: ROOT }))
+  on('session.id', () => ({ value: 'session-a' }))
   on('session.turns', () => ({ value: 7 }))
   on('session.messages', () => ({ value: MESSAGES }))
   on('session.usage', () => ({
@@ -129,14 +153,16 @@ function world(on: On, setup: Setup = {}): World {
     if (setup.fork === 'hang') await new Promise(() => {})
     return { value: { isAnswered: true, text: HANDOFF_BODY, usage: { input_tokens: 40, output_tokens: 900, cache_read_input_tokens: 899_000, cache_creation_input_tokens: 0 } } }
   })
-  on('model.complete', () => {
+  on('model.complete', ($, e) => {
     state.completions++
+    state.completionPrompts.push(typeof e.prompt === 'string' ? e.prompt : JSON.stringify(e.prompt))
     return { value: { isAnswered: true, text: HANDOFF_BODY, usage: { input_tokens: 100_000, output_tokens: 900, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
   })
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     state.asked.push(JSON.stringify(e))
     const question = (e as unknown as { questions: { question: string }[] }).questions[0]!.question
-    return { result: { answers: { [question]: setup.answer ?? 'No' } }, text: setup.answer ?? 'No' }
+    const answer = setup.answerFor?.(question) ?? setup.answer ?? 'No'
+    return { result: { answers: { [question]: answer } }, text: answer }
   })
   on('command.run', ($, e) => {
     state.commands.push(e.command)
@@ -481,7 +507,7 @@ describe('session start', () => {
 describe('auto-load', () => {
   const AUTO = { options: { enabled: true, autoLoad: 'auto' } }
   const ASK = { options: { enabled: true, autoLoad: 'ask' } }
-  const PLAIN = { mode: 'auto', cache: 'cold', contextTokens: 900_000, handoffCurrent: true } as const
+  const PLAIN = { mode: 'auto', cache: 'cold', contextTokens: 900_000, handoffCurrent: true, replace: true } as const
   const prompt = (overrides: Partial<PromptFacts> = {}): PromptFacts => ({ origin: 'composer', text: 'Now run the tests', hasAttachments: false, duringTurn: false, ...overrides })
 
   // A 5m session that went idle at T0 and had its handoff forked 30 seconds before expiry. The fork's
@@ -596,11 +622,203 @@ describe('auto-load', () => {
     expect(decideIntercept({ ...PLAIN, cache: 'unknown', prompt: prompt() })).toEqual({ intercept: false, reason: 'ttl-unknown' })
     expect(decideIntercept({ ...PLAIN, contextTokens: 49_999, prompt: prompt() })).toEqual({ intercept: false, reason: 'context-small' })
     expect(decideIntercept({ ...PLAIN, handoffCurrent: false, prompt: prompt() })).toEqual({ intercept: false, reason: 'no-handoff' })
+    expect(decideIntercept({ ...PLAIN, replace: false, prompt: prompt() })).toEqual({ intercept: false, reason: 'session-stays' })
   })
 
   test('reads Auto-load from config, falling back to ask-once', () => {
     expect(parseAutoLoad('auto')).toBe('auto')
     expect(parseAutoLoad('bogus')).toBe('ask-once')
     expect(parseAutoLoad(undefined)).toBe('ask-once')
+  })
+
+  test('a one-hour cache leaves the session: the handoff is written, the prompt is not cleared', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { files: { [TRANSCRIPT]: turn(T0 - 1_000, 0, 800) } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(3_570_000)
+    expect(state.forks).toHaveLength(1)
+    // Past the fork's own hour, the cache is cold, and the session still stays.
+    await clock.advance(3_600_000)
+    expect((await $.prompt.submit(typed('Now run the tests'))).drop).toBeUndefined()
+    await clock.settle()
+    expect(state.commands).toEqual([])
+  })
+
+  test('a one-hour cache still clears when idle compaction is off', { options: { enabled: true, autoLoad: 'auto' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { files: { [TRANSCRIPT]: turn(T0 - 1_000, 0, 800) }, settings: { idleCompaction: false } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(3_570_000)
+    expect(state.forks).toHaveLength(1)
+    // The fork read the cache and restarted its hour.
+    await clock.advance(3_600_000)
+    expect((await $.prompt.submit(typed('Now run the tests'))).drop).toBeDefined()
+    await clock.settle()
+    expect(state.commands).toEqual(['clear'])
+  })
+
+  test('a resumed one-hour session is left in place', { options: { enabled: true, autoLoad: 'auto' } }, async ($, on) => {
+    mock.clock(on, { now: T0 })
+    world(on, {
+      files: { [`${ROOT}/.claude/cache-magic/handoff.meta.json`]: JSON.stringify(meta({ cacheTtl: '1h' })), [`${ROOT}/.claude/cache-magic/handoff.md`]: HANDOFF_BODY },
+    })
+    const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
+    await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: true })
+    expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeUndefined()
+  })
+
+  test('a resumed one-hour session whose idle compaction is off still loads the handoff', { options: { enabled: true, autoLoad: 'auto' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, {
+      settings: { idleCompaction: false },
+      files: { [`${ROOT}/.claude/cache-magic/handoff.meta.json`]: JSON.stringify(meta({ cacheTtl: '1h' })), [`${ROOT}/.claude/cache-magic/handoff.md`]: HANDOFF_BODY },
+    })
+    const resume = { source: 'resume', session_id: 'session-a', seconds_since_last_response: 7_200, context_tokens: 900_000 } as const
+    await $.classic.SessionStart({ ...resume, prompt_cache_likely_expired: true })
+    expect((await $.prompt.submit(typed('Where were we?'))).drop).toBeDefined()
+    await clock.settle()
+    expect(state.commands).toEqual(['clear'])
+  })
+})
+
+describe('what the handoff keeps', () => {
+  test('an empty or unknown keep list means all four parts', () => {
+    expect(parseKeep(undefined)).toEqual(['instructions', 'decisions', 'files', 'next'])
+    expect(parseKeep('')).toEqual(['instructions', 'decisions', 'files', 'next'])
+    expect(parseKeep('all')).toEqual(['instructions', 'decisions', 'files', 'next'])
+    expect(parseKeep('nope')).toEqual(['instructions', 'decisions', 'files', 'next'])
+    expect(parseKeep('files, bogus, next')).toEqual(['files', 'next'])
+  })
+
+  test('a multi-select answer is matched by its labels, commas and all', () => {
+    const answer = 'Next step and open questions, My instructions, quoted'
+    expect(keepFromAnswer(answer)).toEqual(['instructions', 'next'])
+    expect(keepFromAnswer('something else')).toBeUndefined()
+    expect(writerFromAnswer(WRITER_HAIKU)).toBe('haiku')
+    expect(writerFromAnswer("This session's model")).toBe('session')
+    expect(writerFromAnswer('Opus')).toBeUndefined()
+  })
+
+  test('the prompt carries only the sections they kept, and quotes their words beside it', () => {
+    const prompt = handoffPrompt('## main\n M src/login.test.ts\n', ['next'])
+    expect(prompt).toContain('## Next step')
+    expect(prompt).toContain('## Active task and current state')
+    expect(prompt).not.toContain('## Failed attempts')
+    expect(prompt).not.toContain('M src/login.test.ts')
+    expect(prompt).toContain('still warm')
+    const quotes = quotedInstructions(
+      [
+        { role: 'user', text: 'ok', toolUses: [] },
+        { role: 'user', text: 'Fix the flaky login test', toolUses: [] },
+        { role: 'assistant', text: 'Done.', toolUses: [] },
+        { role: 'user', text: 'Leave the clock alone', toolUses: [] },
+      ],
+      10_000,
+    )
+    expect(quotes).toContain('> Fix the flaky login test')
+    expect(quotes).toContain('> Leave the clock alone')
+    expect(quotes).not.toContain('> ok')
+    expect(withQuotes('# Handoff\n\n## Next step\nShip it', quotes)).toContain('## Instructions, as typed')
+    expect(withQuotes('# Handoff', '')).toBe('# Handoff')
+  })
+
+  test('a five-minute cache clears; a one-hour cache clears only when idle compaction will not run', () => {
+    expect(clearsOnColdPrompt('5m', {})).toBe(true)
+    expect(clearsOnColdPrompt('1h', {})).toBe(false)
+    expect(clearsOnColdPrompt('1h', { idleCompaction: false })).toBe(true)
+    expect(clearsOnColdPrompt('1h', { autoCompactEnabled: false })).toBe(true)
+    expect(clearsOnColdPrompt('1h', { idleCompaction: true })).toBe(false)
+    expect(clearsOnColdPrompt('unknown', { idleCompaction: false })).toBe(false)
+  })
+
+  test('compaction of the main session writes a handoff first, and a precompute or a subagent does not', () => {
+    expect(shouldWriteBeforeCompact({ trigger: 'auto', contextTokens: 900_000 })).toBe(true)
+    expect(shouldWriteBeforeCompact({ trigger: 'manual', contextTokens: 900_000 })).toBe(true)
+    expect(shouldWriteBeforeCompact({ trigger: 'precompute', contextTokens: 900_000 })).toBe(false)
+    expect(shouldWriteBeforeCompact({ trigger: 'auto', agentId: 'worker', contextTokens: 900_000 })).toBe(false)
+    expect(shouldWriteBeforeCompact({ trigger: 'auto', contextTokens: 49_999 })).toBe(false)
+    expect(shouldWriteBeforeCompact({
+      trigger: 'auto',
+      contextTokens: 900_000,
+      existing: { ageMs: 60_000, sameSession: true, turnsSince: 0 },
+    })).toBe(false)
+  })
+})
+
+describe('the warm-cache ask', () => {
+  const chosen = (question: string) =>
+    question === WRITER_QUESTION ? WRITER_HAIKU : 'My instructions, quoted, Next step and open questions'
+
+  test('the first large turn asks what to keep and who writes it, and that handoff follows', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { askPrefs: true, answerFor: chosen })
+    await $.classic.Stop(stop)
+    await clock.settle()
+    expect(state.asked[0]).toContain(KEEP_QUESTION)
+    expect(state.asked[0]).toContain('My instructions, quoted')
+    expect(state.asked[0]).toContain('"multiSelect":true')
+    expect(state.asked[1]).toContain(WRITER_QUESTION)
+    await clock.advance(270_000)
+    expect(state.forks).toHaveLength(0)
+    expect(state.completions).toBe(1)
+    expect(state.completionPrompts[0]).toContain('## Next step')
+    expect(state.completionPrompts[0]).not.toContain('## Failed attempts')
+    const handoff = state.files.get(`${ROOT}/.claude/cache-magic/handoff.md`)
+    expect(handoff).toContain('> Fix the flaky login test')
+    expect(handoff).toContain('while the cache was warm')
+  })
+
+  test('dismissing the question keeps the defaults and does not ask again', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { askPrefs: true, answer: 'No' })
+    await $.classic.Stop(stop)
+    await clock.settle()
+    expect(state.asked).toHaveLength(1)
+    expect(state.saved).toEqual([])
+    await $.classic.Stop(stop)
+    await clock.settle()
+    expect(state.asked).toHaveLength(1)
+  })
+
+  test('the next session start records the choice in /config', { options: { enabled: true, keep: 'instructions,next' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { askPrefs: true, answerFor: chosen })
+    await $.classic.Stop(stop)
+    await clock.settle()
+    expect(state.saved).toEqual([])
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    expect(state.saved).toEqual([{ key: 'cache-magic.generator', value: 'haiku' }])
+  })
+})
+
+describe('before a compaction', () => {
+  test('writes the handoff, tells the summary where it is, and does not clear', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+    await clock.settle()
+    expect(state.forks).toHaveLength(1)
+    expect(state.forks[0]).toContain('still warm')
+    expect(state.files.get(`${ROOT}/.claude/cache-magic/handoff.md`)).toContain('> Fix the flaky login test')
+    expect(state.compactNotes[0]).toContain('while the cache was still warm')
+    expect(state.commands).toEqual([])
+  })
+
+  test('a precompute or a subagent writes nothing', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.session.compact({ trigger: 'precompute', messages: MESSAGES })
+    await $.session.compact({ trigger: 'auto', agentId: 'worker', messages: MESSAGES })
+    await clock.settle()
+    expect(state.forks).toHaveLength(0)
+  })
+
+  test('a second compaction in the same stretch does not write another handoff', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.session.compact({ trigger: 'auto', messages: MESSAGES })
+    await $.session.compact({ trigger: 'manual', messages: MESSAGES })
+    await clock.settle()
+    expect(state.forks).toHaveLength(1)
   })
 })
