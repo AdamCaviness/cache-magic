@@ -1,8 +1,8 @@
 {
-  "name": "cache-handoff",
-  "displayName": "Cache Handoff",
+  "name": "cache-magic",
+  "displayName": "Cache Magic",
   "version": "0.1.1",
-  "description": "Writes a structured handoff while a large session's prompt cache is still warm, then offers to load it once the cache has gone cold",
+  "description": "Writes a structured handoff while a large session's prompt cache is still warm, then sends a prompt that arrives after it expired with the handoff instead of the full context",
   "author": {
     "name": "Adam Caviness"
   },
@@ -17,25 +17,34 @@
   "userConfig": {
     "enabled": {
       "type": "boolean",
-      "title": "Cache Handoff: Enabled",
-      "description": "Turns Cache Handoff on. Off by default: when on, an idle session over 50k tokens spends one model call writing .claude/handoff.md just before its prompt cache expires",
-      "default": false
+      "title": "Cache Magic: On",
+      "description": "Cache Magic runs only in sessions over 50k tokens. Just before an idle session's prompt cache expires, it spends one model call, mostly read from the cache, writing .claude/handoff.md. A prompt sent after the cache expired can then go out after the handoff instead of with the full context",
+      "default": true
+    },
+    "autoLoad": {
+      "type": "string",
+      "title": "Cache Magic: Auto-load",
+      "description": "What happens to a prompt you send after the prompt cache expired, when a handoff is ready. ask-once: ask the first time and save your answer here as auto or ask. auto: clear the session and send the prompt after the handoff. ask: ask each time. off: send it with the full context",
+      "default": "ask-once",
+      "options": ["ask-once", "auto", "ask", "off"]
     },
     "cacheTtlOverride": {
       "type": "string",
-      "title": "Cache Handoff: Cache TTL override",
-      "description": "5m or 1h. Leave empty to follow CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m. Set 1h if you are on a subscription within plan usage and have not set either",
-      "default": ""
+      "title": "Cache Magic: Cache TTL fallback",
+      "description": "Rarely needed: the mod reads the TTL the API applied from the session transcript. This is used only before the first response that wrote to the cache. auto follows CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m",
+      "default": "auto",
+      "options": ["auto", "5m", "1h"]
     },
     "generator": {
       "type": "string",
-      "title": "Cache Handoff: Generator",
-      "description": "fork (default) replays this session's own cached context on its own model, so input bills at the cache-read rate. haiku sends a trimmed transcript to Haiku at high effort: cheaper per token but uncached, and it sees only the newest ~100k tokens",
-      "default": "fork"
+      "title": "Cache Magic: Handoff writer",
+      "description": "session: the session's own model writes it from its cached context, billed at the cache-read rate, seeing everything. haiku: Haiku writes it from a trimmed transcript, uncached and seeing only the newest ~100k tokens. Cheaper per token, less complete",
+      "default": "session",
+      "options": ["session", "haiku"]
     },
     "timeoutSeconds": {
       "type": "number",
-      "title": "Cache Handoff: Generation timeout",
+      "title": "Cache Magic: Handoff timeout",
       "description": "Seconds to wait for the handoff before giving up and logging to .claude/handoff-error.log",
       "default": 90,
       "min": 10,

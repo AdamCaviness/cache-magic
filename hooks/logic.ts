@@ -28,6 +28,7 @@ export function parseTtl(value: unknown): Ttl | undefined {
 }
 
 export type TtlSources = {
+  observed?: Ttl
   override?: unknown
   force5m?: string
   env?: string
@@ -35,14 +36,71 @@ export type TtlSources = {
   enable1h?: string
 }
 
-// Claude Code's own precedence, with the mod's override first. Unset falls to
-// 5m: a subscription's 1h default drops to 5m on usage credits, and firing
-// early is cheap where firing late misses the cache.
-export function resolveTtl(sources: TtlSources): Ttl {
+// `observed`: read off the transcript. `configured`: the override, an env
+// variable or a setting. `assumed`: nothing said, so 5m.
+export type TtlSource = 'observed' | 'configured' | 'assumed'
+
+export type ResolvedTtl = { ttl: Ttl; source: TtlSource }
+
+// The TTL the API recorded wins. Without one, Claude Code's own precedence,
+// with the mod's override first. Unset falls to 5m: a subscription's 1h
+// default drops to 5m on usage credits, and firing early is cheap where
+// firing late misses the cache.
+export function resolveTtl(sources: TtlSources): ResolvedTtl {
+  if (sources.observed) return { ttl: sources.observed, source: 'observed' }
+  const configured = (ttl: Ttl): ResolvedTtl => ({ ttl, source: 'configured' })
   const override = parseTtl(sources.override)
-  if (override) return override
-  if (sources.force5m === '1') return '5m'
-  return parseTtl(sources.env) ?? parseTtl(sources.setting) ?? (sources.enable1h === '1' ? '1h' : '5m')
+  if (override) return configured(override)
+  if (sources.force5m === '1') return configured('5m')
+  const stated = parseTtl(sources.env) ?? parseTtl(sources.setting) ?? (sources.enable1h === '1' ? '1h' : undefined)
+  return stated ? configured(stated) : { ttl: '5m', source: 'assumed' }
+}
+
+export type CacheObservation = { ttl?: Ttl; requestAt?: number }
+
+type TranscriptRow = {
+  type?: unknown
+  isMeta?: unknown
+  isSidechain?: unknown
+  timestamp?: unknown
+  message?: { usage?: { cache_creation?: { ephemeral_5m_input_tokens?: unknown; ephemeral_1h_input_tokens?: unknown } } }
+}
+
+const count = (value: unknown) => (typeof value === 'number' ? value : 0)
+
+const rowTime = (row: TranscriptRow) => (typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN)
+
+// From the main conversation's newest rows: the TTL the API applied to its
+// newest cache write (each response records its writes by TTL), and when the
+// request behind its newest response was sent, which is when the cache's
+// clock restarted. A response with writes at both TTLs counts as 5m, the TTL
+// of the conversation's own tail.
+export function observeCache(jsonl: string): CacheObservation {
+  const lines = jsonl.split('\n')
+  let ttl: Ttl | undefined
+  let requestAt: number | undefined
+  let sawResponse = false
+  for (let index = lines.length - 1; index >= 0 && (ttl === undefined || requestAt === undefined); index--) {
+    const line = lines[index]!.trim()
+    if (!line) continue
+    let row: TranscriptRow
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row.isSidechain === true || row.isMeta === true) continue
+    if (row.type === 'assistant') {
+      sawResponse = true
+      const written = row.message?.usage?.cache_creation
+      if (ttl === undefined && count(written?.ephemeral_5m_input_tokens) > 0) ttl = '5m'
+      else if (ttl === undefined && count(written?.ephemeral_1h_input_tokens) > 0) ttl = '1h'
+    } else if (row.type === 'user' && sawResponse && requestAt === undefined) {
+      const at = rowTime(row)
+      if (Number.isFinite(at)) requestAt = at
+    }
+  }
+  return { ttl, requestAt }
 }
 
 // The statusLine payload's `prompt_cache` fields this mod reads.
@@ -112,14 +170,14 @@ export function lastRealRowAt(jsonl: string): number | undefined {
   for (let index = lines.length - 1; index >= 0; index--) {
     const line = lines[index]!.trim()
     if (!line) continue
-    let row: { type?: unknown; isMeta?: unknown; timestamp?: unknown }
+    let row: TranscriptRow
     try {
       row = JSON.parse(line)
     } catch {
       continue
     }
     if ((row.type !== 'user' && row.type !== 'assistant') || row.isMeta === true) continue
-    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN
+    const at = rowTime(row)
     if (Number.isFinite(at)) return at
   }
   return undefined
@@ -207,28 +265,25 @@ export function parseMeta(text: string): HandoffMeta | undefined {
 }
 
 export function renderHandoff(body: string, meta: HandoffMeta): string {
-  const header = `<!-- cache-handoff: generated ${meta.timestamp} from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
+  const header = `<!-- cache-magic: generated ${meta.timestamp} from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
   return `${header}\n${body.trim()}\n`
 }
 
 export type OfferInput = {
   meta: HandoffMeta | undefined
   nowMs: number
-  source: string
   sessionId: string
-  cacheLikelyExpired?: boolean
   offeredTimestamp?: unknown
 }
 
+// A new session is offered an earlier session's handoff. A resumed session's
+// own handoff waits for its first prompt, which auto-load intercepts.
 export function shouldOffer(input: OfferInput): input is OfferInput & { meta: HandoffMeta } {
   const meta = input.meta
   if (!meta || input.offeredTimestamp === meta.timestamp) return false
   const ageMs = input.nowMs - Date.parse(meta.timestamp)
   if (!(ageMs >= 0 && ageMs < OFFER_WINDOW_MS)) return false
-  if (input.source === 'startup') return meta.sessionId !== input.sessionId
-  // A resumed session only benefits when it is the one the handoff describes and its cache went cold.
-  if (input.source === 'resume') return meta.sessionId === input.sessionId && input.cacheLikelyExpired !== false
-  return false
+  return meta.sessionId !== input.sessionId
 }
 
 export function formatTimestamp(iso: string): string {
@@ -240,13 +295,87 @@ export function offerQuestion(meta: HandoffMeta): string {
   return `A handoff from ${formatTimestamp(meta.timestamp)} is available. ${files} modified. Clear this session and load it?`
 }
 
-export function loadMessage(handoff: string): string {
+export function loadMessage(handoff: string, prompt?: string): string {
+  if (prompt === undefined) {
+    return [
+      'Continue from this handoff, written by the previous session before its prompt cache expired.',
+      'Read it, do not retry anything under "Failed attempts", and wait for my go-ahead before starting the next step.',
+      '',
+      handoff.trim(),
+    ].join('\n')
+  }
   return [
-    'Continue from this handoff, written by the previous session before its prompt cache expired.',
-    'Read it, do not retry anything under "Failed attempts", and wait for my go-ahead before starting the next step.',
+    'Continue from this handoff, written by this session before its prompt cache expired.',
+    'Read it, do not retry anything under "Failed attempts", then answer my message after it.',
     '',
     handoff.trim(),
+    '',
+    '---',
+    '',
+    'My message:',
+    '',
+    prompt,
   ].join('\n')
+}
+
+// `ask-once` asks at the first cold prompt and saves the answer as `auto` or `ask`.
+export const AUTO_LOAD_MODES = ['ask-once', 'auto', 'ask', 'off'] as const
+
+export type AutoLoad = (typeof AUTO_LOAD_MODES)[number]
+
+export function parseAutoLoad(value: unknown): AutoLoad {
+  return AUTO_LOAD_MODES.find(mode => mode === value) ?? 'ask-once'
+}
+
+export type PromptFacts = {
+  origin: string
+  text: string
+  hasAttachments: boolean
+  duringTurn: boolean
+}
+
+export type InterceptInput = {
+  mode: AutoLoad
+  prompt: PromptFacts
+  // `unknown` when the TTL is only assumed: a guess must not throw away a warm cache.
+  cache: 'cold' | 'warm' | 'unknown'
+  contextTokens: number
+  handoffCurrent: boolean
+}
+
+export type InterceptReason = 'off' | 'not-typed' | 'not-plain' | 'warm' | 'ttl-unknown' | 'context-small' | 'no-handoff'
+
+export type InterceptDecision = { intercept: true } | { intercept: false; reason: InterceptReason }
+
+// A plugin's prompt expands neither images nor @-mentions, so a prompt with
+// either is left to go as typed.
+export function decideIntercept(input: InterceptInput): InterceptDecision {
+  const pass = (reason: InterceptReason): InterceptDecision => ({ intercept: false, reason })
+  if (input.mode === 'off') return pass('off')
+  const { prompt } = input
+  if (prompt.origin !== 'composer' || prompt.duringTurn) return pass('not-typed')
+  const text = prompt.text.trim()
+  if (!text || prompt.hasAttachments || /^[/!]/.test(text) || /(^|\s)@\S/.test(text)) return pass('not-plain')
+  if (input.cache === 'warm') return pass('warm')
+  if (input.cache === 'unknown') return pass('ttl-unknown')
+  if (input.contextTokens < MIN_CONTEXT_TOKENS) return pass('context-small')
+  if (!input.handoffCurrent) return pass('no-handoff')
+  return { intercept: true }
+}
+
+// When the cache is surely gone: one TTL after it was last read. The Stop
+// comes after the turn's last request, so it errs toward warm; a handoff fork
+// reads the cache again and restarts its clock.
+export function cacheGoneAt(stoppedAt: number, forkReadAt: number | undefined, ttl: Ttl): number {
+  return Math.max(stoppedAt, forkReadAt ?? 0) + TTL_SECONDS[ttl] * 1000
+}
+
+export function thousands(tokens: number): string {
+  return `${Math.round(tokens / 1000)}k`
+}
+
+export function coldPromptQuestion(contextTokens: number, handoffAt: string): string {
+  return `The prompt cache has expired, so this prompt would re-send ${thousands(contextTokens)} tokens at full price. Clear the session and send it after the handoff from ${formatTimestamp(handoffAt)}?`
 }
 
 // Text of the newest messages that fit in maxChars, with the opening request
