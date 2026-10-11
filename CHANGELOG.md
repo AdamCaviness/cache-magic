@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/AdamCaviness/cache-magic/compare/v0.2.0...v0.3.0) (2026-10-11)
+
+
+### Features
+
+* keep the mod's files in a git-ignored .claude/cache-magic folder ([#7](https://github.com/AdamCaviness/cache-magic/issues/7)) ([e9901f4](https://github.com/AdamCaviness/cache-magic/commit/e9901f4790d12f21f65151de0eefcbd0cfd080b1))
+
 ## [0.2.0](https://github.com/AdamCaviness/cache-magic/compare/v0.1.1...v0.2.0) (2026-10-11)
 
 
