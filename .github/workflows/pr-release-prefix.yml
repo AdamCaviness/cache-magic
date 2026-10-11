@@ -13,10 +13,9 @@ name: pr-release-prefix
 #   no prefix, ships code       -> rewritten to feat: (minor)
 #   no prefix, only non-shipping -> left as-is (skips)
 #
-# Non-shipping paths never reach users of the mod: cache-handoff/tests/,
-# .github/, .gitignore, LICENSE, cache-handoff/tsconfig.json, *.md at the root
-# or in cache-handoff/, and release tooling. Everything else ships
-# (cache-handoff/hooks/, cache-handoff/.claude-plugin/, .claude-plugin/).
+# Non-shipping paths never reach users of the mod: tests/, .github/, .gitignore,
+# LICENSE, tsconfig.json, root-level *.md, and release tooling. Everything else
+# ships (hooks/, .claude-plugin/).
 
 on:
   pull_request:
@@ -48,10 +47,10 @@ jobs:
           # A path is non-shipping if it never reaches users of the mod.
           is_skipped() {
             case "$1" in
-              cache-handoff/tests/*|.github/*) return 0 ;;
-              .gitignore|LICENSE|cache-handoff/tsconfig.json|release-please-config.json|.release-please-manifest.json) return 0 ;;
+              tests/*|.github/*) return 0 ;;
+              .gitignore|LICENSE|tsconfig.json|release-please-config.json|.release-please-manifest.json) return 0 ;;
               *.md)
-                case "${1#cache-handoff/}" in
+                case "$1" in
                   */*) return 1 ;;
                   *) return 0 ;;
                 esac ;;
