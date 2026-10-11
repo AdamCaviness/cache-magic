@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/AdamCaviness/cache-magic/compare/v0.3.0...v0.4.0) (2026-10-11)
+
+
+### Features
+
+* choose the handoff and leave one-hour sessions in place ([#10](https://github.com/AdamCaviness/cache-magic/issues/10)) ([379483f](https://github.com/AdamCaviness/cache-magic/commit/379483f64d3e90793006db0b53b60443891b5ea2))
+
 ## [0.3.0](https://github.com/AdamCaviness/cache-magic/compare/v0.2.0...v0.3.0) (2026-10-11)
 
 
