@@ -61,6 +61,7 @@ type World = {
   asked: string[]
   filled: string[]
   saved: { key: string; value: unknown }[]
+  logs: string[]
 }
 
 // Answers every call the mod makes beneath it, from memory.
@@ -84,6 +85,7 @@ function world(on: On, setup: Setup = {}): World {
     asked: [],
     filled: [],
     saved: [],
+    logs: [],
   }
   mock.store(on)
   mock.env(on, {})
@@ -105,7 +107,10 @@ function world(on: On, setup: Setup = {}): World {
     }
     return ran(0, '## main\n M src/login.test.ts\n')
   })
-  on('ui.log', () => ({ value: undefined }))
+  on('ui.log', ($, e) => {
+    if (e.to !== 'debug') state.logs.push(e.text)
+    return { value: undefined }
+  })
   on('fs.read', ($, e) => {
     const text = state.files.get(e.path)
     return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
@@ -394,7 +399,7 @@ describe('handoff generation', () => {
     expect(state.forks).toHaveLength(0)
   })
 
-  test('disabled by default: a Stop schedules nothing', async ($, on) => {
+  test('turned off: a Stop schedules nothing', { options: { enabled: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: T0 })
     const state = world(on)
     await $.classic.Stop(stop)
@@ -432,6 +437,24 @@ describe('session start', () => {
     await clock.settle()
     expect(state.asked).toEqual([])
     expect(state.submitted).toEqual([])
+  })
+
+  test('says once, on the first new session, what it does and where the settings are', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-a' })
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-b' })
+    await clock.settle()
+    expect(state.logs.filter(text => text.startsWith('Cache Magic is on.'))).toHaveLength(1)
+    expect(state.logs[0]).toContain('/config, rows starting "Cache Magic"')
+  })
+
+  test('is on with no options set', async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on)
+    await $.classic.SessionStart({ source: 'startup', session_id: 'session-a' })
+    await clock.settle()
+    expect(state.logs[0]).toStartWith('Cache Magic is on.')
   })
 
   test('declining leaves the session alone', ENABLED, async ($, on) => {

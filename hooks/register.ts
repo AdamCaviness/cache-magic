@@ -56,6 +56,9 @@ const NEVER = 'No, and never intercept again'
 const SAVED: Record<string, AutoLoad> = { [LOAD_ALWAYS]: 'auto', [LOAD_ASK]: 'ask', [SEND_FULL]: 'ask', [NEVER]: 'off' }
 const AUTO_LOAD_KEY = 'cache-magic.autoLoad'
 const AUTO_LOAD_WHERE = '/config, row "Cache Magic: Auto-load"'
+const WELCOMED_KEY = 'welcomed'
+const WELCOME =
+  'Cache Magic is on. When a session over 50k tokens sits idle, it writes a handoff to .claude/handoff.md just before the prompt cache expires. If you come back later, it can clear the session and send your prompt after the handoff instead of re-sending the whole context. Settings: /config, rows starting "Cache Magic".'
 
 type Timer = { cancel: () => void }
 type Idle = {
@@ -308,6 +311,12 @@ async function offer($: EngineInterface, e: { session_id: string }) {
   await $.prompt.submit({ text: loadMessage(handoff) })
 }
 
+async function welcome($: EngineInterface) {
+  if (await $.store.get(WELCOMED_KEY)) return
+  await $.store.set(WELCOMED_KEY, true)
+  $.ui.log(WELCOME)
+}
+
 // The handoff to load in place of a prompt that would re-send a cold cache, or undefined to let it go.
 async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLoad): Promise<ColdPrompt | undefined> {
   const nowMs = await $.clock.now()
@@ -424,6 +433,7 @@ export const register: Register = (on, options) => {
 
   on('classic.SessionStart', { source: ['startup', 'resume'] }, async ($, e, next) => {
     if (e.source === 'startup') {
+      void welcome($).catch(error => logError($, `welcome failed: ${error instanceof Error ? error.message : String(error)}`))
       void offer($, e).catch(error => logError($, `offer failed: ${error instanceof Error ? error.message : String(error)}`))
     } else {
       idle?.timer?.cancel()

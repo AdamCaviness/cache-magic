@@ -4,39 +4,37 @@ A Claude Code mod for one quota problem: a large session that sits idle past its
 
 Cache Magic handles both sides of that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/handoff.md`. When you come back and send a prompt after the cache has expired, it catches the prompt before it goes out, clears the session, and sends your prompt after the handoff instead of the full context. The first time, it asks whether to do that automatically from then on or to ask each time.
 
-It is off by default.
+It does nothing in sessions under 50k tokens. The first new session after install shows one line saying what it does and where its settings are.
 
 ## Install
 
-Cache Magic is listed in [agentic-marketplace](https://github.com/adamcaviness/agentic-marketplace):
+Cache Magic is listed in [agentic-marketplace](https://github.com/adamcaviness/agentic-marketplace), and [agentic-toolkit](https://github.com/adamcaviness/agentic-toolkit) installs it for you. On its own:
 
 ```bash
-claude plugin install cache-magic --marketplace adamcaviness/agentic-marketplace --config enabled=true
+claude plugin install cache-magic --marketplace adamcaviness/agentic-marketplace
 ```
 
-`--marketplace` adds agentic-marketplace the first time. To install now and turn it on later, leave out `--config enabled=true` and set **Cache Magic: Enabled** in `/plugin configure cache-magic@agentic-marketplace`.
-
-Then turn on auto-update: `/plugin` → **Marketplaces** → **agentic-marketplace** → **Enable auto-update**. Claude Code leaves it off for marketplaces outside Anthropic's, so without it you keep the version you first installed.
-
-[agentic-toolkit](https://github.com/adamcaviness/agentic-toolkit) installs it for you, still off until you enable it.
+`--marketplace` adds agentic-marketplace the first time. Then turn on auto-update: `/plugin` → **Marketplaces** → **agentic-marketplace** → **Enable auto-update**. Claude Code leaves it off for marketplaces outside Anthropic's, so without it you keep the version you first installed.
 
 To try it for one session from a clone of this repository, without installing:
 
 ```bash
-claude --plugin-dir . --settings '{"pluginConfigs":{"cache-magic@inline":{"options":{"enabled":true}}}}'
+claude --plugin-dir .
 ```
 
 `claude plugin install .` does not work: as of Claude Code 2.1.296, `install` only takes a plugin name from a marketplace.
 
 ## Configuration
 
-| Option | Default | What it does |
-| --- | --- | --- |
-| `enabled` | `false` | Turns the mod on. When off, it registers no hooks. |
-| `autoLoad` | `ask-once` | What happens to a prompt sent after the cache expired; see Auto-load below. `ask-once` asks the first time and saves your answer as `auto` or `ask`. `auto` loads the handoff without asking. `ask` asks each time. `off` sends the prompt with the full context. |
-| `cacheTtlOverride` | empty | `5m` or `1h`, used only when the transcript doesn't yet show the TTL (see below). Empty follows Claude Code's own order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H`, then `5m`. |
-| `generator` | `fork` | How the handoff is written; see Cost below. `haiku` is the alternative. |
-| `timeoutSeconds` | `90` | How long to wait for the handoff before giving up and logging the failure. |
+Every setting is a row in `/config` starting with "Cache Magic". The same settings are in `/plugin configure cache-magic@agentic-marketplace`.
+
+| Row | Key | Default | What it does |
+| --- | --- | --- | --- |
+| Cache Magic: On | `enabled` | on | Turn it off and the mod registers no hooks. |
+| Cache Magic: Auto-load | `autoLoad` | `ask-once` | What happens to a prompt sent after the cache expired; see Auto-load below. `ask-once` asks the first time and saves your answer as `auto` or `ask`. `auto` loads the handoff without asking. `ask` asks each time. `off` sends the prompt with the full context. |
+| Cache Magic: Handoff writer | `generator` | `session` | Who writes the handoff; see Cost below. `haiku` is the alternative. |
+| Cache Magic: Handoff timeout | `timeoutSeconds` | `90` | How long to wait for the handoff before giving up and logging the failure. |
+| Cache Magic: Cache TTL fallback | `cacheTtlOverride` | `auto` | Rarely needed. `5m` or `1h`, used only when the transcript doesn't yet show the TTL (see below). `auto` follows Claude Code's own order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H`, then `5m`. |
 
 **You don't need to set the TTL.** Every response the API returns records how many tokens it wrote to the cache at each TTL (`cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`), and Claude Code keeps that in the session transcript. The mod reads the newest response's split, so it knows whether this session's cache lasts five minutes or an hour, whatever your plan or billing state. The override and settings matter only before the first response that wrote to the cache.
 
@@ -100,9 +98,9 @@ Yes sends the handoff as the first message. Each handoff is offered once. The qu
 
 ## Cost
 
-The default generator, `fork`, uses `$.model.fork`. A fork replays the session's last request on the session's own model and appends the handoff instructions, so the API serves the existing context from the warm cache. Input bills at the cache-read rate, about 0.1× of normal input, and you pay full price only for the handoff text written. The fork's request also counts as a cache hit, which keeps the cache warm for another TTL.
+The default writer, `session`, uses `$.model.fork`. A fork replays the session's last request on the session's own model and appends the handoff instructions, so the API serves the existing context from the warm cache. Input bills at the cache-read rate, about 0.1× of normal input, and you pay full price only for the handoff text written. The fork's request also counts as a cache hit, which keeps the cache warm for another TTL.
 
-The `haiku` generator calls `$.model.complete` with Haiku at high effort. **Haiku can't read this session's cache**, because each model has its own. That call sends a trimmed transcript: the first request plus the newest messages, up to about 400k characters (roughly 100k tokens), uncached. It costs less per token but sees less. A failed attempt early in a long session can fall outside what it reads. Use it when the fork's cache read on a very large context costs more than you want.
+The `haiku` writer calls `$.model.complete` with Haiku at high effort. **Haiku can't read this session's cache**, because each model has its own. That call sends a trimmed transcript: the first request plus the newest messages, up to about 400k characters (roughly 100k tokens), uncached. It costs less per token but sees less. A failed attempt early in a long session can fall outside what it reads. Use it when the fork's cache read on a very large context costs more than you want.
 
 ## API limits
 
