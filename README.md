@@ -18,6 +18,8 @@ claude plugin install cache-handoff --marketplace adamcaviness/agentic-marketpla
 
 Then turn on auto-update: `/plugin` → **Marketplaces** → **agentic-marketplace** → **Enable auto-update**. Claude Code leaves it off for marketplaces outside Anthropic's, so without it you keep the version you first installed.
 
+[agentic-toolkit](https://github.com/adamcaviness/agentic-toolkit) installs it for you, still off until you enable it.
+
 To try it for one session from a clone of this repository, without installing:
 
 ```bash
