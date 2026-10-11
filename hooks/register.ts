@@ -33,10 +33,11 @@ import {
   type TtlSource,
 } from './logic'
 
-const DIR = '.claude'
+const DIR = '.claude/cache-magic'
 const HANDOFF = `${DIR}/handoff.md`
 const META = `${DIR}/handoff.meta.json`
 const ERROR_LOG = `${DIR}/handoff-error.log`
+const GITIGNORE = `${DIR}/.gitignore`
 const PRIOR_SLOTS = [`${DIR}/handoff.1.md`, `${DIR}/handoff.2.md`, `${DIR}/handoff.3.md`]
 const DEFAULT_TIMEOUT_SECONDS = 90
 const RECHECK_MS = 5_000
@@ -58,7 +59,7 @@ const AUTO_LOAD_KEY = 'cache-magic.autoLoad'
 const AUTO_LOAD_WHERE = '/config, row "Cache Magic: Auto-load"'
 const WELCOMED_KEY = 'welcomed'
 const WELCOME =
-  'Cache Magic is on. When a session over 50k tokens sits idle, it writes a handoff to .claude/handoff.md just before the prompt cache expires. If you come back later, it can clear the session and send your prompt after the handoff instead of re-sending the whole context. Settings: /config, rows starting "Cache Magic".'
+  'When a session over 50k tokens sits idle, Cache Magic writes a handoff to .claude/cache-magic/handoff.md just before the prompt cache expires. If you come back later, it can clear the session and send your prompt after the handoff instead of re-sending the whole context. Settings: /config, rows starting "Cache Magic".'
 
 type Timer = { cancel: () => void }
 type Idle = {
@@ -98,13 +99,19 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
   }
 }
 
+// Everything the mod writes stays in its own folder, which ignores itself in git.
+async function writeOwn($: EngineInterface, root: string, path: string, text: string) {
+  if ((await readText($, at(root, GITIGNORE))) === undefined) await $.fs.write(at(root, GITIGNORE), '*\n')
+  await $.fs.write(at(root, path), text)
+}
+
 async function logError($: EngineInterface, message: string) {
   try {
     const root = await $.session.root()
     const line = `${new Date(await $.clock.now()).toISOString()} ${message}`
     const existing = (await readText($, at(root, ERROR_LOG))) ?? ''
-    await $.fs.write(at(root, ERROR_LOG), appendLog(existing, line, ERROR_LOG_LINES))
-    $.ui.log(`cache-magic: ${message}`, { to: 'debug' })
+    await writeOwn($, root, ERROR_LOG, appendLog(existing, line, ERROR_LOG_LINES))
+    $.ui.log(message, { to: 'debug' })
   } catch {
     // The error log is the last resort; nothing is left to report to.
   }
@@ -194,7 +201,7 @@ async function rotate($: EngineInterface, root: string) {
   const shifted = [current, ...prior].slice(0, PRIOR_SLOTS.length)
   for (let index = shifted.length - 1; index >= 0; index--) {
     const text = shifted[index]
-    if (text !== undefined) await $.fs.write(at(root, PRIOR_SLOTS[index]!), text)
+    if (text !== undefined) await writeOwn($, root, PRIOR_SLOTS[index]!, text)
   }
 }
 
@@ -216,12 +223,12 @@ async function generate($: EngineInterface, current: Idle, contextSize: number, 
     turns: await $.session.turns(),
   }
   await rotate($, root)
-  await $.fs.write(at(root, HANDOFF), renderHandoff(result.text, meta))
-  await $.fs.write(at(root, META), `${JSON.stringify(meta, null, 2)}\n`)
+  await writeOwn($, root, HANDOFF, renderHandoff(result.text, meta))
+  await writeOwn($, root, META, `${JSON.stringify(meta, null, 2)}\n`)
   const missing = missingSections(result.text)
   if (missing.length) await logError($, `handoff written without sections: ${missing.join(', ')}`)
   const cached = generator === 'fork' ? `, ${result.usage.cache_read_input_tokens} tokens read from cache` : ''
-  $.ui.log(`cache-magic: wrote ${HANDOFF} before the prompt cache expired${cached}`)
+  $.ui.log(`Wrote ${HANDOFF} before the prompt cache expired${cached}`)
 }
 
 async function evaluate($: EngineInterface, current: Idle, generator: Generator, timeoutMs: number) {
@@ -245,7 +252,7 @@ async function evaluate($: EngineInterface, current: Idle, generator: Generator,
     },
   })
   if (!decision.act) {
-    $.ui.log(`cache-magic: skipped, ${decision.reason}`, { to: 'debug' })
+    $.ui.log(`Skipped, ${decision.reason}`, { to: 'debug' })
     // A draft may be cleared or sent before the cache lapses; look again until it does.
     if (decision.reason === 'user-typing' && secondsRemaining(cache, nowMs) * 1000 > RECHECK_MS) {
       current.timer = $.clock.after(RECHECK_MS, () => void evaluate($, current, generator, timeoutMs))
@@ -282,7 +289,7 @@ async function turnEndedAt($: EngineInterface, e: { session_id: string; transcri
       claimed: false,
     }
     idle = current
-    $.ui.log(`cache-magic: cache TTL ${ttl} (${source}), from ${new Date(cacheFrom).toISOString()}`, { to: 'debug' })
+    $.ui.log(`Cache TTL ${ttl} (${source}), from ${new Date(cacheFrom).toISOString()}`, { to: 'debug' })
     const elapsed = (await $.clock.now()) - cacheFrom
     const delay = Math.max(0, (TTL_SECONDS[ttl] - TRIGGER_WINDOW_SECONDS) * 1000 - elapsed)
     current.timer = $.clock.after(delay, () => void evaluate($, current, plan.generator, plan.timeoutMs))
@@ -348,7 +355,7 @@ async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLo
     decision = decideIntercept({ mode, prompt, cache, contextTokens, handoffCurrent })
   }
   if (!decision.intercept) {
-    if (decision.reason !== 'not-typed') $.ui.log(`cache-magic: prompt sent as typed, ${decision.reason}`, { to: 'debug' })
+    if (decision.reason !== 'not-typed') $.ui.log(`Prompt sent as typed, ${decision.reason}`, { to: 'debug' })
     return undefined
   }
   const handoff = await readText($, at(root, HANDOFF))
@@ -377,7 +384,7 @@ async function loadInstead($: EngineInterface, e: PromptSubmitInput, cold: ColdP
     await $.command.run({ command: 'clear' })
     await $.prompt.submit({ text: loadMessage(cold.handoff, e.text) })
     $.ui.log(
-      `cache-magic: the prompt cache had expired, so the session was cleared and your prompt sent after the handoff instead of re-sending ${thousands(cold.contextTokens)} tokens. /resume restores the full session. Auto-load is in ${AUTO_LOAD_WHERE}.`,
+      `The prompt cache had expired, so the session was cleared and your prompt sent after the handoff instead of re-sending ${thousands(cold.contextTokens)} tokens. /resume restores the full session. Auto-load is in ${AUTO_LOAD_WHERE}.`,
     )
   } else {
     await $.prompt.submit({ text: e.text, asUser: true })

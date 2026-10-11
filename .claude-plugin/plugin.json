@@ -18,7 +18,7 @@
     "enabled": {
       "type": "boolean",
       "title": "Cache Magic: On",
-      "description": "Cache Magic runs only in sessions over 50k tokens. Just before an idle session's prompt cache expires, it spends one model call, mostly read from the cache, writing .claude/handoff.md. A prompt sent after the cache expired can then go out after the handoff instead of with the full context",
+      "description": "Cache Magic runs only in sessions over 50k tokens. Just before an idle session's prompt cache expires, it spends one model call, mostly read from the cache, writing .claude/cache-magic/handoff.md. A prompt sent after the cache expired can then go out after the handoff instead of with the full context",
       "default": true
     },
     "autoLoad": {
@@ -57,7 +57,7 @@
     "timeoutSeconds": {
       "type": "number",
       "title": "Cache Magic: Handoff timeout",
-      "description": "Seconds to wait for the handoff before giving up and logging to .claude/handoff-error.log",
+      "description": "Seconds to wait for the handoff before giving up and logging to .claude/cache-magic/handoff-error.log",
       "default": 90,
       "min": 10,
       "max": 600
