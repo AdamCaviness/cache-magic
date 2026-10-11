@@ -3,31 +3,46 @@ import type { EngineInterface, ModelForkResult, PromptSubmitInput, Register } fr
 import {
   appendLog,
   cacheGoneAt,
+  clearsOnColdPrompt,
   coldPromptQuestion,
   decide,
   decideIntercept,
   filesModified,
   handoffPrompt,
+  KEEP,
+  KEEP_QUESTION,
+  keepFromAnswer,
   lastRealRowAt,
   loadMessage,
+  MIN_CONTEXT_TOKENS,
   missingSections,
   observeCache,
   offerQuestion,
   parseAutoLoad,
+  parseKeep,
   parseMeta,
+  quotedInstructions,
   renderHandoff,
   resolveTtl,
   secondsRemaining,
+  sectionsFor,
   shouldOffer,
+  shouldWriteBeforeCompact,
   snapshotFrom,
   thousands,
   transcriptDigest,
   TRIGGER_WINDOW_SECONDS,
   TTL_SECONDS,
   turnHasEnded,
+  withQuotes,
+  WRITER_HAIKU,
+  WRITER_QUESTION,
+  WRITER_SESSION,
+  writerFromAnswer,
   type AutoLoad,
   type HandoffMeta,
   type InterceptInput,
+  type KeepId,
   type ResolvedTtl,
   type Ttl,
   type TtlSource,
@@ -47,6 +62,19 @@ const TAIL_BYTES = 2 * 1024 * 1024
 const ERROR_LOG_LINES = 200
 const HAIKU_DIGEST_CHARS = 400_000
 const HAIKU_MAX_TOKENS = 8_000
+const QUOTE_CHARS = 6_000
+const PREFS_ASKED = 'prefsAsked'
+const PENDING_KEEP = 'pendingKeep'
+const PENDING_WRITER = 'pendingWriter'
+const KEEP_KEY = 'cache-magic.keep'
+const GENERATOR_KEY = 'cache-magic.generator'
+const COMPACT_NOTE = 'Cache Magic kept a handoff at .claude/cache-magic/handoff.md while the cache was still warm.'
+const SHORT_KEEP: Record<KeepId, string> = {
+  instructions: 'quoted instructions',
+  decisions: 'decisions and failed attempts',
+  files: 'files and git status',
+  next: 'the next step',
+}
 const YES = 'Yes, clear and load it'
 const NO = 'No'
 const LOAD_ALWAYS = 'Yes, and load automatically from now on'
@@ -59,7 +87,7 @@ const AUTO_LOAD_KEY = 'cache-magic.autoLoad'
 const AUTO_LOAD_WHERE = '/config, row "Cache Magic: Auto-load"'
 const WELCOMED_KEY = 'welcomed'
 const WELCOME =
-  'When a session over 50k tokens sits idle, Cache Magic writes a handoff to .claude/cache-magic/handoff.md just before the prompt cache expires. If you come back later, it can clear the session and send your prompt after the handoff instead of re-sending the whole context. Settings: /config, rows starting "Cache Magic".'
+  'When a session over 50k tokens sits idle, Cache Magic writes a handoff to .claude/cache-magic/handoff.md while the prompt cache is still warm. On a five-minute cache it can clear the session and send your next prompt after the handoff. On a one-hour cache it leaves the session, and writes the handoff again before Claude Code compacts. The first large turn asks what to keep. Settings: /config, rows starting "Cache Magic".'
 
 type Timer = { cancel: () => void }
 type Idle = {
@@ -82,12 +110,15 @@ type Resumed = { sessionId: string; lastResponseAt: number; contextTokens: numbe
 type ColdPrompt = { handoff: string; meta: HandoffMeta; contextTokens: number }
 
 type Generator = 'fork' | 'haiku'
-type Plan = { override: unknown; generator: Generator; timeoutMs: number }
+type Choice = { generator: Generator; keep: readonly KeepId[] }
+type PrefOptions = { generator?: unknown; keep?: unknown }
+type Plan = { override: unknown; timeoutMs: number; options: PrefOptions }
 
 let idle: Idle | undefined
 let resumed: Resumed | undefined
 let activeTurn = false
 let generating = false
+let askingPrefs = false
 
 const at = (root: string, path: string) => `${root}/${path}`
 
@@ -176,8 +207,13 @@ function withTimeout<T>($: EngineInterface, work: Promise<T>, ms: number): Promi
   return Promise.race([work, timeout]).finally(() => timer?.cancel())
 }
 
-async function requestHandoff($: EngineInterface, generator: Generator, timeoutMs: number): Promise<ModelForkResult | typeof TIMED_OUT> {
-  const prompt = handoffPrompt(await workingTree($))
+async function requestHandoff(
+  $: EngineInterface,
+  generator: Generator,
+  timeoutMs: number,
+  keep: readonly KeepId[],
+): Promise<ModelForkResult | typeof TIMED_OUT> {
+  const prompt = handoffPrompt(keep.includes('files') ? await workingTree($) : undefined, keep)
   if (generator === 'fork') return withTimeout($, $.model.fork({ prompt }), timeoutMs)
   const messages = await $.session.messages()
   return $.model.complete({
@@ -205,13 +241,20 @@ async function rotate($: EngineInterface, root: string) {
   }
 }
 
-async function generate($: EngineInterface, current: Idle, contextSize: number, generator: Generator, timeoutMs: number) {
+async function generate($: EngineInterface, current: Idle, contextSize: number, timeoutMs: number, choice: { generator: Generator; keep: readonly KeepId[] }): Promise<boolean> {
+  const { generator, keep } = choice
   if (generator === 'fork') current.forkReadAt = await $.clock.now()
-  const result = await requestHandoff($, generator, timeoutMs)
-  if (result === TIMED_OUT) return logError($, `${generator} timed out after ${timeoutMs / 1000}s; no handoff written`)
+  const messages = await $.session.messages()
+  const quotes = keep.includes('instructions') ? quotedInstructions(messages, QUOTE_CHARS) : ''
+  const result = await requestHandoff($, generator, timeoutMs, keep)
+  if (result === TIMED_OUT) {
+    await logError($, `${generator} timed out after ${timeoutMs / 1000}s; no handoff written`)
+    return false
+  }
   if (!result.isAnswered) {
     const detail = result.reason === 'api-error' ? ` (${result.error}, status ${result.status})` : ''
-    return logError($, `${generator} returned no handoff: ${result.reason}${detail}`)
+    await logError($, `${generator} returned no handoff: ${result.reason}${detail}`)
+    return false
   }
   const root = await $.session.root()
   const meta: HandoffMeta = {
@@ -219,19 +262,20 @@ async function generate($: EngineInterface, current: Idle, contextSize: number, 
     sessionId: current.sessionId,
     cacheTtl: current.ttl,
     contextSize,
-    filesModified: filesModified(await $.session.messages()).length,
+    filesModified: filesModified(messages).length,
     turns: await $.session.turns(),
   }
   await rotate($, root)
-  await writeOwn($, root, HANDOFF, renderHandoff(result.text, meta))
+  await writeOwn($, root, HANDOFF, renderHandoff(withQuotes(result.text, quotes), meta))
   await writeOwn($, root, META, `${JSON.stringify(meta, null, 2)}\n`)
-  const missing = missingSections(result.text)
+  const missing = missingSections(result.text, sectionsFor(keep))
   if (missing.length) await logError($, `handoff written without sections: ${missing.join(', ')}`)
   const cached = generator === 'fork' ? `, ${result.usage.cache_read_input_tokens} tokens read from cache` : ''
-  $.ui.log(`Wrote ${HANDOFF} before the prompt cache expired${cached}`)
+  $.ui.log(`Kept ${HANDOFF} while the cache was still warm${cached}`)
+  return true
 }
 
-async function evaluate($: EngineInterface, current: Idle, generator: Generator, timeoutMs: number) {
+async function evaluate($: EngineInterface, current: Idle, timeoutMs: number, choiceFor: () => Promise<{ generator: Generator; keep: readonly KeepId[] }>) {
   if (idle !== current || generating) return
   const nowMs = await $.clock.now()
   const contextSize = (await $.session.usage()).context.tokens ?? 0
@@ -255,14 +299,14 @@ async function evaluate($: EngineInterface, current: Idle, generator: Generator,
     $.ui.log(`Skipped, ${decision.reason}`, { to: 'debug' })
     // A draft may be cleared or sent before the cache lapses; look again until it does.
     if (decision.reason === 'user-typing' && secondsRemaining(cache, nowMs) * 1000 > RECHECK_MS) {
-      current.timer = $.clock.after(RECHECK_MS, () => void evaluate($, current, generator, timeoutMs))
+      current.timer = $.clock.after(RECHECK_MS, () => void evaluate($, current, timeoutMs, choiceFor))
     }
     return
   }
   current.claimed = true
   generating = true
   try {
-    await generate($, current, contextSize, generator, timeoutMs)
+    await generate($, current, contextSize, timeoutMs, await choiceFor())
   } catch (error) {
     await logError($, `handoff failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
@@ -292,7 +336,8 @@ async function turnEndedAt($: EngineInterface, e: { session_id: string; transcri
     $.ui.log(`Cache TTL ${ttl} (${source}), from ${new Date(cacheFrom).toISOString()}`, { to: 'debug' })
     const elapsed = (await $.clock.now()) - cacheFrom
     const delay = Math.max(0, (TTL_SECONDS[ttl] - TRIGGER_WINDOW_SECONDS) * 1000 - elapsed)
-    current.timer = $.clock.after(delay, () => void evaluate($, current, plan.generator, plan.timeoutMs))
+    current.timer = $.clock.after(delay, () => void evaluate($, current, plan.timeoutMs, () => readChoice($, plan.options)))
+    void maybeAskPrefs($, plan.options)
   } catch (error) {
     await logError($, `scheduling failed: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -324,6 +369,10 @@ async function welcome($: EngineInterface) {
   $.ui.log(WELCOME)
 }
 
+async function cacheSettings($: EngineInterface) {
+  return (await $.settings.read().catch(() => ({}))) as { idleCompaction?: unknown; autoCompactEnabled?: unknown }
+}
+
 // The handoff to load in place of a prompt that would re-send a cold cache, or undefined to let it go.
 async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLoad): Promise<ColdPrompt | undefined> {
   const nowMs = await $.clock.now()
@@ -332,10 +381,14 @@ async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLo
   // The handoff must be newer than the session's last activity.
   let quietSince = Infinity
   let contextTokens = 0
+  let replace = true
   if (idle) {
     sessionId = idle.sessionId
     quietSince = idle.stoppedAt
-    if (idle.ttlSource !== 'assumed') cache = nowMs >= cacheGoneAt(idle.stoppedAt, idle.forkReadAt, idle.ttl) ? 'cold' : 'warm'
+    if (idle.ttlSource !== 'assumed') {
+      cache = nowMs >= cacheGoneAt(idle.stoppedAt, idle.forkReadAt, idle.ttl) ? 'cold' : 'warm'
+      replace = clearsOnColdPrompt(idle.ttl, await cacheSettings($))
+    }
   } else if (resumed) {
     sessionId = resumed.sessionId
     quietSince = resumed.lastResponseAt
@@ -343,16 +396,17 @@ async function coldPrompt($: EngineInterface, e: PromptSubmitInput, mode: AutoLo
     contextTokens = resumed.contextTokens
   }
   const prompt = { origin: e.origin.kind, text: e.text, hasAttachments: (e.attachments ?? []).length > 0, duringTurn: activeTurn || e.turnId !== undefined }
-  // Files are read only for a prompt that would otherwise go cold.
-  let decision = decideIntercept({ mode, prompt, cache, contextTokens: Infinity, handoffCurrent: true })
+  // Files are read only for a prompt that would otherwise go cold. `replace` is applied once the handoff's own TTL is known.
+  let decision = decideIntercept({ mode, prompt, cache, contextTokens: Infinity, handoffCurrent: true, replace: true })
   let meta: HandoffMeta | undefined
   let root = ''
   if (decision.intercept) {
     if (idle) contextTokens = (await $.session.usage()).context.tokens ?? 0
     root = await $.session.root()
     meta = parseMeta((await readText($, at(root, META))) ?? '')
+    if (resumed) replace = clearsOnColdPrompt(meta?.cacheTtl ?? 'unknown', await cacheSettings($))
     const handoffCurrent = !!meta && meta.sessionId === sessionId && Date.parse(meta.timestamp) >= quietSince
-    decision = decideIntercept({ mode, prompt, cache, contextTokens, handoffCurrent })
+    decision = decideIntercept({ mode, prompt, cache, contextTokens, handoffCurrent, replace })
   }
   if (!decision.intercept) {
     if (decision.reason !== 'not-typed') $.ui.log(`Prompt sent as typed, ${decision.reason}`, { to: 'debug' })
@@ -397,10 +451,70 @@ async function loadInstead($: EngineInterface, e: PromptSubmitInput, cold: ColdP
   }
 }
 
+function keptList(keep: readonly KeepId[]): string {
+  const names = KEEP.filter(part => keep.includes(part.id)).map(part => SHORT_KEEP[part.id])
+  if (names.length <= 1) return names[0] ?? 'the handoff'
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
+
+// Asks once, on the first large turn, while the person is still at the keyboard.
+// The answer is kept in the store so the idle timer is not cancelled by a /config reload.
+async function maybeAskPrefs($: EngineInterface, options: PrefOptions) {
+  if (askingPrefs) return
+  askingPrefs = true
+  try {
+    if (await $.store.get(PREFS_ASKED)) return
+    const tokens = (await $.session.usage()).context.tokens ?? 0
+    if (tokens < MIN_CONTEXT_TOKENS) return
+    if ((await $.prompt.read()).text.trim() !== '') return
+    await $.store.set(PREFS_ASKED, true)
+    const keepAnswer = await $.ui.ask(KEEP_QUESTION, { header: 'Cache Magic', multiSelect: true, options: KEEP.map(part => part.label) }).catch(() => undefined)
+    const keep = keepAnswer === undefined ? undefined : keepFromAnswer(keepAnswer)
+    if (!keep) return
+    const writerAnswer = await $.ui.ask(WRITER_QUESTION, { header: 'Cache Magic', options: [WRITER_SESSION, WRITER_HAIKU] }).catch(() => undefined)
+    const picked = writerAnswer === undefined ? undefined : writerFromAnswer(writerAnswer)
+    await $.store.set(PENDING_KEEP, keep.join(','))
+    if (picked) await $.store.set(PENDING_WRITER, picked)
+    const writer = picked ?? (options.generator === 'haiku' ? 'haiku' : 'session')
+    const who = writer === 'haiku' ? 'Haiku' : "this session's model"
+    $.ui.toast(`The handoff will keep ${keptList(keep)}, written by ${who}.`, { timeoutMs: 10_000 })
+  } catch (error) {
+    await logError($, `could not ask what to keep: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    askingPrefs = false
+  }
+}
+
+async function readChoice($: EngineInterface, options: PrefOptions): Promise<Choice> {
+  const pendingWriter = await $.store.get(PENDING_WRITER)
+  const pendingKeep = await $.store.get(PENDING_KEEP)
+  const generator: Generator = pendingWriter === 'haiku' ? 'haiku' : pendingWriter === 'session' ? 'fork' : options.generator === 'haiku' ? 'haiku' : 'fork'
+  return { generator, keep: parseKeep(typeof pendingKeep === 'string' ? pendingKeep : options.keep) }
+}
+
+// One row per session start. A reload follows the first write, so the other row waits for the next start.
+async function flushPrefs($: EngineInterface, options: PrefOptions) {
+  const keep = await $.store.get(PENDING_KEEP)
+  const writer = await $.store.get(PENDING_WRITER)
+  const keepText = typeof keep === 'string' ? keep : undefined
+  const writerText = writer === 'haiku' || writer === 'session' ? writer : undefined
+  const haveKeep = typeof options.keep === 'string' && options.keep ? options.keep : 'instructions,decisions,files,next'
+  const haveWriter = options.generator === 'haiku' ? 'haiku' : 'session'
+  if (keepText && keepText !== haveKeep) {
+    await $.config.set({ key: KEEP_KEY, value: keepText })
+    return
+  }
+  if (keepText) await $.store.delete(PENDING_KEEP)
+  if (writerText && writerText !== haveWriter) {
+    await $.config.set({ key: GENERATOR_KEY, value: writerText })
+    return
+  }
+  if (writerText) await $.store.delete(PENDING_WRITER)
+}
+
 export const register: Register = (on, options) => {
   // A change in /config reloads the module, so options are read once here.
   if (options.enabled !== true) return
-  const generator: Generator = options.generator === 'haiku' ? 'haiku' : 'fork'
   const seconds = typeof options.timeoutSeconds === 'number' && options.timeoutSeconds > 0 ? options.timeoutSeconds : DEFAULT_TIMEOUT_SECONDS
   const timeoutMs = Math.round(seconds * 1000)
   const autoLoad = parseAutoLoad(options.autoLoad)
@@ -424,7 +538,60 @@ export const register: Register = (on, options) => {
     return { drop: `Cache Magic: the prompt cache has expired. ${then}` }
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
-  const plan: Plan = { override: options.cacheTtlOverride, generator, timeoutMs }
+  const plan: Plan = { override: options.cacheTtlOverride, timeoutMs, options }
+
+  on('session.start', async ($, e, next) => {
+    await flushPrefs($, options).catch(error => logError($, `could not save the handoff choice: ${error instanceof Error ? error.message : String(error)}`))
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  on('config.set', async ($, e, next) => {
+    // A change in the menu wins over a choice that has not been recorded yet.
+    if (e.origin?.kind !== 'plugin') {
+      if (e.key === KEEP_KEY) await $.store.delete(PENDING_KEEP)
+      if (e.key === GENERATOR_KEY) await $.store.delete(PENDING_WRITER)
+    }
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
+  on('session.compact', async ($, e, next) => {
+    if (e.trigger === 'precompute' || e.agentId) return next(e)
+    if (generating) return next(e)
+    generating = true
+    try {
+      const tokens = (await $.session.usage()).context.tokens ?? 0
+      const root = await $.session.root()
+      const nowMs = await $.clock.now()
+      const meta = parseMeta((await readText($, at(root, META))) ?? '')
+      const sessionId = idle?.sessionId ?? await $.session.id()
+      const turns = await $.session.turns()
+      const existing = meta && {
+        ageMs: nowMs - Date.parse(meta.timestamp),
+        sameSession: meta.sessionId === sessionId,
+        turnsSince: turns - meta.turns,
+      }
+      if (!shouldWriteBeforeCompact({ trigger: e.trigger, contextTokens: tokens, existing: existing || undefined })) return next(e)
+      const ttl = idle?.ttl ?? (await sessionTtl($, plan.override, undefined)).ttl
+      const current: Idle = idle ?? {
+        stoppedAt: nowMs,
+        cacheFrom: nowMs,
+        sessionId,
+        transcriptPath: '',
+        ttl,
+        ttlSource: 'assumed',
+        claimed: false,
+      }
+      const wrote = await generate($, current, tokens, plan.timeoutMs, await readChoice($, plan.options))
+      if (!wrote) return next(e)
+      const instructions = e.instructions ? `${e.instructions}\n\n${COMPACT_NOTE}` : COMPACT_NOTE
+      return next({ ...e, instructions })
+    } catch (error) {
+      await logError($, `handoff before compaction failed: ${error instanceof Error ? error.message : String(error)}`)
+      return next(e)
+    } finally {
+      generating = false
+    }
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('classic.Stop', async ($, e, next) => {
     // Background work will wake the session, and its requests keep the cache warm.

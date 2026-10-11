@@ -2,7 +2,7 @@
   "name": "cache-magic",
   "displayName": "Cache Magic",
   "version": "0.3.0",
-  "description": "Writes a structured handoff while a large session's prompt cache is still warm, then sends a prompt that arrives after it expired with the handoff instead of the full context",
+  "description": "Keeps a handoff while a large session's prompt cache is still warm. On a five-minute cache, a late prompt can go out after the handoff instead of the full context. On a one-hour cache the session stays, and compaction is pointed at the handoff.",
   "author": {
     "name": "Adam Caviness"
   },
@@ -18,13 +18,13 @@
     "enabled": {
       "type": "boolean",
       "title": "Cache Magic: On",
-      "description": "Cache Magic runs only in sessions over 50k tokens. Just before an idle session's prompt cache expires, it spends one model call, mostly read from the cache, writing .claude/cache-magic/handoff.md. A prompt sent after the cache expired can then go out after the handoff instead of with the full context",
+      "description": "Cache Magic runs only in sessions over 50k tokens. While the prompt cache is still warm it spends one model call, mostly read from the cache, writing .claude/cache-magic/handoff.md. A five-minute cache can then send a late prompt after the handoff. A one-hour cache leaves the session alone",
       "default": true
     },
     "autoLoad": {
       "type": "string",
       "title": "Cache Magic: Auto-load",
-      "description": "What happens to a prompt you send after the prompt cache expired, when a handoff is ready. ask-once: ask the first time and save your answer here as auto or ask. auto: clear the session and send the prompt after the handoff. ask: ask each time. off: send it with the full context",
+      "description": "What happens to a prompt you send after a five-minute cache expired, when a handoff is ready. The same choice applies to a one-hour cache only when idle compaction is off (idleCompaction or autoCompactEnabled set to false). ask-once: ask the first time and save your answer here as auto or ask. auto: clear the session and send the prompt after the handoff. ask: ask each time. off: send it with the full context",
       "default": "ask-once",
       "options": [
         "ask-once",
@@ -43,6 +43,12 @@
         "5m",
         "1h"
       ]
+    },
+    "keep": {
+      "type": "string",
+      "title": "Cache Magic: Handoff keeps",
+      "description": "Comma-separated parts the handoff holds: instructions (your messages, quoted), decisions (choices and failed attempts), files (paths, commands, and git status), next (the next step and open questions). Anything else keeps all four. The first large turn asks this in the answers row; the answer is recorded here on the next session",
+      "default": "instructions,decisions,files,next"
     },
     "generator": {
       "type": "string",

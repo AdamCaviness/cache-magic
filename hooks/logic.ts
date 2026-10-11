@@ -20,6 +20,87 @@ export const SECTIONS = [
   'Open questions',
 ] as const
 
+// The four parts a person can keep. Labels contain commas, and a multi-select
+// answer joins labels with commas, so answers are matched by label, not split.
+export const KEEP = [
+  { id: 'instructions', label: 'My instructions, quoted' },
+  { id: 'decisions', label: 'Decisions and failed attempts' },
+  { id: 'files', label: 'Files, commands, and git status' },
+  { id: 'next', label: 'Next step and open questions' },
+] as const
+
+export type KeepId = (typeof KEEP)[number]['id']
+
+export const DEFAULT_KEEP: readonly KeepId[] = ['instructions', 'decisions', 'files', 'next']
+
+const KEEP_SECTIONS: Record<KeepId, readonly string[]> = {
+  instructions: [],
+  decisions: ['Decisions made and their rationale', 'Failed attempts'],
+  files: ['Files modified and working tree status', 'Commands run and their outcomes'],
+  next: ['Next step', 'Open questions'],
+}
+
+export const KEEP_QUESTION =
+  'The prompt cache is still warm, which is the cheap moment to keep a handoff. What should it hold?'
+
+export const WRITER_SESSION = "This session's model"
+export const WRITER_HAIKU = 'Haiku'
+export const WRITER_QUESTION =
+  "This session's model reads that warm cache and sees the whole session. Haiku costs less and sees only the newest part. Who keeps the handoff?"
+
+const KEEP_IDS = new Set<string>(KEEP.map(part => part.id))
+
+// A missing or unrecognized value keeps everything: an empty handoff is not a product.
+export function parseKeep(value: unknown): KeepId[] {
+  if (typeof value !== 'string') return [...DEFAULT_KEEP]
+  const text = value.trim()
+  if (!text || text === 'all') return [...DEFAULT_KEEP]
+  const wanted = new Set(text.split(',').map(part => part.trim()).filter(part => KEEP_IDS.has(part)))
+  const kept = KEEP.filter(part => wanted.has(part.id)).map(part => part.id)
+  return kept.length ? kept : [...DEFAULT_KEEP]
+}
+
+export function keepFromAnswer(answer: string): KeepId[] | undefined {
+  const kept = KEEP.filter(part => answer.includes(part.label)).map(part => part.id)
+  return kept.length ? kept : undefined
+}
+
+export function writerFromAnswer(answer: string): 'session' | 'haiku' | undefined {
+  if (answer === WRITER_SESSION) return 'session'
+  if (answer === WRITER_HAIKU) return 'haiku'
+  return undefined
+}
+
+export function sectionsFor(keep: readonly KeepId[]): string[] {
+  const allowed = new Set<string>(['Active task and current state'])
+  for (const id of keep) for (const section of KEEP_SECTIONS[id]) allowed.add(section)
+  return SECTIONS.filter(section => allowed.has(section))
+}
+
+// Five minutes always pays the full context back. An hour does only when Claude
+// Code will not compact the idle session itself.
+export function clearsOnColdPrompt(
+  ttl: Ttl | 'unknown',
+  settings: { idleCompaction?: unknown; autoCompactEnabled?: unknown },
+): boolean {
+  if (ttl === '5m') return true
+  if (ttl !== '1h') return false
+  return settings.idleCompaction === false || settings.autoCompactEnabled === false
+}
+
+export function shouldWriteBeforeCompact(input: {
+  trigger: string
+  agentId?: string
+  contextTokens: number
+  existing?: ExistingHandoff
+}): boolean {
+  if (input.trigger === 'precompute' || input.agentId) return false
+  if (input.contextTokens < MIN_CONTEXT_TOKENS) return false
+  const existing = input.existing
+  if (existing && existing.ageMs < FRESH_HANDOFF_MS && (!existing.sameSession || existing.turnsSince === 0)) return false
+  return true
+}
+
 const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit'])
 
 export function parseTtl(value: unknown): Ttl | undefined {
@@ -209,32 +290,74 @@ export function filesModified(messages: readonly SessionMessage[]): string[] {
   return [...paths]
 }
 
-export function handoffPrompt(workingTree: string | undefined): string {
-  const tree = workingTree === undefined
-    ? 'The working tree status could not be read; describe it from the conversation.'
-    : `Current \`git status --porcelain=v1 --branch\`:\n\`\`\`\n${workingTree.trim() || '(clean)'}\n\`\`\``
-  return [
-    'Stop working on the task. Do not call any tools. The prompt cache for this session is about to expire,',
-    'and a fresh session will continue from a handoff document instead of this context.',
-    'Write that handoff now, for an engineer who has not seen this conversation.',
+export function handoffPrompt(workingTree: string | undefined, keep: readonly KeepId[] = DEFAULT_KEEP): string {
+  const sections = sectionsFor(keep)
+  const lines = [
+    'Stop working on the task. Do not call any tools. The prompt cache is still warm,',
+    'which is the cheap moment to keep a handoff. Write it now, for an engineer who has not seen this conversation.',
     '',
     'Reply with markdown only, starting with `# Handoff`, then exactly these sections in this order:',
-    ...SECTIONS.map(section => `## ${section}`),
+    ...sections.map(section => `## ${section}`),
     '',
     'Rules:',
     '- Be concrete: exact file paths, commands, error messages, branch names, and identifiers.',
-    '- Under "Failed attempts", list every approach that was tried and abandoned, with why it failed,',
-    '  so the next session does not retry it. Write "None" only if nothing failed.',
-    '- Under "Next step", give the single next action precisely enough to execute without asking.',
-    '- Write "None" under any other section that has nothing to report.',
-    '- Stay under 1,500 words.',
-    '',
-    tree,
-  ].join('\n')
+  ]
+  if (keep.includes('decisions')) {
+    lines.push(
+      '- Under "Failed attempts", list every approach that was tried and abandoned, with why it failed,',
+      '  so the next session does not retry it. Write "None" only if nothing failed.',
+    )
+  }
+  if (keep.includes('next')) {
+    lines.push('- Under "Next step", give the single next action precisely enough to execute without asking.')
+  }
+  if (keep.includes('instructions')) {
+    lines.push('- Their own instructions are appended verbatim after your reply. Do not paraphrase them.')
+  }
+  lines.push('- Write "None" under any section that has nothing to report.', '- Stay under 1,500 words.')
+  if (keep.includes('files')) {
+    lines.push(
+      '',
+      workingTree === undefined
+        ? 'The working tree status could not be read; describe it from the conversation.'
+        : `Current \`git status --porcelain=v1 --branch\`:\n\`\`\`\n${workingTree.trim() || '(clean)'}\n\`\`\``,
+    )
+  }
+  return lines.join('\n')
 }
 
-export function missingSections(markdown: string): string[] {
-  return SECTIONS.filter(section => !new RegExp(`^##\\s+${section}\\s*$`, 'mi').test(markdown))
+const AFFIRMATION = /^(y|n|yes|no|ok|okay|k|sure|thanks|thank you|continue|go|do it|go ahead|lgtm)\.?$/i
+
+// The person's own words, first instruction kept, then the newest that fit.
+// Short affirmations are not instructions.
+export function quotedInstructions(messages: readonly SessionMessage[], maxChars: number): string {
+  const texts = messages
+    .filter(message => message.role === 'user')
+    .map(message => message.text.trim())
+    .filter(text => text.length >= 12 && !AFFIRMATION.test(text))
+  const first = texts[0]
+  if (first === undefined) return ''
+  const rest: string[] = []
+  let size = first.length
+  for (let index = texts.length - 1; index > 0; index--) {
+    const text = texts[index]!
+    if (size + text.length > maxChars) break
+    rest.unshift(text)
+    size += text.length
+  }
+  const omitted = texts.length - 1 - rest.length
+  const chosen = [first, ...(omitted > 0 ? [`[${omitted} earlier instructions omitted]`] : []), ...rest]
+  return chosen.map(text => (text.startsWith('[') ? text : `> ${text.replaceAll('\n', '\n> ')}`)).join('\n\n')
+}
+
+export function withQuotes(body: string, quotes: string): string {
+  const trimmed = quotes.trim()
+  if (!trimmed) return body
+  return `${body.trim()}\n\n## Instructions, as typed\n\n${trimmed}\n`
+}
+
+export function missingSections(markdown: string, sections: readonly string[] = SECTIONS): string[] {
+  return sections.filter(section => !new RegExp(`^##\\s+${section}\\s*$`, 'mi').test(markdown))
 }
 
 export type HandoffMeta = {
@@ -265,7 +388,7 @@ export function parseMeta(text: string): HandoffMeta | undefined {
 }
 
 export function renderHandoff(body: string, meta: HandoffMeta): string {
-  const header = `<!-- cache-magic: generated ${meta.timestamp} from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
+  const header = `<!-- cache-magic: kept ${meta.timestamp} while the cache was warm, from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
   return `${header}\n${body.trim()}\n`
 }
 
@@ -341,9 +464,11 @@ export type InterceptInput = {
   cache: 'cold' | 'warm' | 'unknown'
   contextTokens: number
   handoffCurrent: boolean
+  // False on a one-hour cache Claude Code will compact itself: write the file, leave the session.
+  replace: boolean
 }
 
-export type InterceptReason = 'off' | 'not-typed' | 'not-plain' | 'warm' | 'ttl-unknown' | 'context-small' | 'no-handoff'
+export type InterceptReason = 'off' | 'not-typed' | 'not-plain' | 'warm' | 'ttl-unknown' | 'context-small' | 'no-handoff' | 'session-stays'
 
 export type InterceptDecision = { intercept: true } | { intercept: false; reason: InterceptReason }
 
@@ -360,6 +485,7 @@ export function decideIntercept(input: InterceptInput): InterceptDecision {
   if (input.cache === 'unknown') return pass('ttl-unknown')
   if (input.contextTokens < MIN_CONTEXT_TOKENS) return pass('context-small')
   if (!input.handoffCurrent) return pass('no-handoff')
+  if (!input.replace) return pass('session-stays')
   return { intercept: true }
 }
 

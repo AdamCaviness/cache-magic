@@ -2,7 +2,12 @@
 
 A Claude Code mod for one quota problem: a large session that sits idle past its prompt cache TTL. The next prompt, however small, re-sends the whole context at full input price. On a 900k-token session that can cost 15 to 20% of a 5-hour usage window ([anthropics/claude-code#51218](https://github.com/anthropics/claude-code/issues/51218)).
 
-Cache Magic handles both sides of that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/cache-magic/handoff.md`. When you come back and send a prompt after the cache has expired, it catches the prompt before it goes out, clears the session, and sends your prompt after the handoff instead of the full context. The first time, it asks whether to do that automatically from then on or to ask each time.
+The cheap moment is while the cache is still warm. About 30 seconds before it expires, Cache Magic spends one cache read writing a handoff to `.claude/cache-magic/handoff.md`. What goes in it is yours to pick: your instructions quoted, decisions and failed attempts, files and git status, the next step. The first large turn asks, in the answers row above the prompt, and the choice is kept.
+
+What happens when you come back depends on the cache:
+
+- **Five minutes.** Idle compaction does not run on a five-minute cache. A prompt sent after the expiry can clear the session and go out after the handoff instead of the full context. The first time, it asks whether to do that from then on or to ask each time.
+- **One hour.** Claude Code compacts these itself (`Compacted while idle, before the prompt cache expired`). Cache Magic writes the handoff and leaves the session. A compaction writes that file first when this idle stretch does not already have one, and the summary is told where it is. The clear-and-send path runs only when idle compaction will not: `idleCompaction` or `autoCompactEnabled` set to `false`.
 
 It does nothing in sessions under 50k tokens. The first new session after install shows one line saying what it does and where its settings are.
 
@@ -31,7 +36,8 @@ Every setting is a row in `/config` starting with "Cache Magic". The same settin
 | Row | Key | Default | What it does |
 | --- | --- | --- | --- |
 | Cache Magic: On | `enabled` | on | Turn it off and the mod registers no hooks. |
-| Cache Magic: Auto-load | `autoLoad` | `ask-once` | What happens to a prompt sent after the cache expired; see Auto-load below. `ask-once` asks the first time and saves your answer as `auto` or `ask`. `auto` loads the handoff without asking. `ask` asks each time. `off` sends the prompt with the full context. |
+| Cache Magic: Auto-load | `autoLoad` | `ask-once` | What happens to a prompt sent after a five-minute cache expired, and after a one-hour cache when idle compaction is off. `ask-once` asks the first time and saves your answer as `auto` or `ask`. `auto` loads the handoff without asking. `ask` asks each time. `off` sends the prompt with the full context. A one-hour cache with idle compaction left on never clears the session. |
+| Cache Magic: Handoff keeps | `keep` | `instructions,decisions,files,next` | Comma-separated: `instructions` (your messages, quoted into the file), `decisions` (choices and failed attempts), `files` (paths, commands, and git status), `next` (the next step and open questions). The current task is always kept. Anything unrecognized keeps all four. The first large turn asks this; the answer is recorded here on the next session. |
 | Cache Magic: Handoff writer | `generator` | `session` | Who writes the handoff; see Cost below. `haiku` is the alternative. |
 | Cache Magic: Handoff timeout | `timeoutSeconds` | `90` | How long to wait for the handoff before giving up and logging the failure. |
 | Cache Magic: Cache TTL fallback | `cacheTtlOverride` | `auto` | Rarely needed. `5m` or `1h`, used only when the transcript doesn't yet show the TTL (see below). `auto` follows Claude Code's own order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H`, then `5m`. |
@@ -50,7 +56,9 @@ Every setting is a row in `/config` starting with "Cache Magic". The same settin
 - There is no handoff under an hour old from this session with no turns since.
 - No handoff has been written yet in this idle period.
 
-**The handoff** is a markdown file with these sections: active task and current state; files modified and working tree status; commands run and their outcomes; decisions made and their rationale; failed attempts; next step; open questions. The prompt includes `git status --porcelain=v1 --branch`, so the working tree section is current. It also tells the model to list every abandoned approach under "Failed attempts", so the fresh session doesn't retry dead ends.
+**The handoff** always has the current task. The other sections follow `keep`: files and commands (with `git status --porcelain=v1 --branch` when that part is on), decisions and failed attempts, the next step and open questions. Your own instructions are not paraphrased. They are copied out of the transcript and appended under "Instructions, as typed", first instruction kept, then the newest that fit.
+
+**Before a compaction** (`session.compact`, including idle compaction and `/compact`), the same file is written first, for the main conversation only, when the context is still at least 50k tokens and this idle stretch does not already have a handoff. The summary is told the file is at `.claude/cache-magic/handoff.md`. A precompute and a subagent's own compaction are left alone. The session is not cleared.
 
 **Files written**, under the project root:
 
@@ -65,11 +73,14 @@ The folder holds a `.gitignore` of `*`, so none of it is committed and your own 
 
 ## Auto-load
 
+**On the first turn over 50k tokens**, the answers row asks what the handoff should hold (pick any of the four) and who should write it: this session's model, which reads the warm cache, or Haiku, which costs less and sees only the newest part. Dismissing keeps the defaults and does not ask again. The answer is used for the rest of the session immediately. It is written into `/config` at the next session start, so saving it does not cancel the idle timer. A draft in the prompt box waits; the question is asked on a later turn.
+
 **When you send a prompt** (the `prompt.submit` hook), the mod catches it before it goes out only if all of these hold:
 
 - You typed it and pressed Enter, while no turn was running. Prompts from other plugins, peers, and the SDK go through.
 - It is plain text: not a `/` command or `!` shell line, with no image and no `@` mention. A prompt the mod sends on your behalf can't carry those, so the mod leaves them alone.
 - The cache is surely gone: one TTL after the later of the turn's `Stop` and the handoff fork, which reads the cache and restarts its clock. If the TTL is only assumed (the transcript showed none and nothing is configured), the mod never intercepts, so it can't throw away a warm cache on a guess.
+- The cache is one this mod is willing to clear: five minutes, or one hour with `idleCompaction` or `autoCompactEnabled` set to `false`. A one-hour cache otherwise stays as it is. The handoff file is already written.
 - The context is at least 50k tokens.
 - `.claude/cache-magic/handoff.md` is this session's, written after its last turn.
 
