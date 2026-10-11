@@ -1,0 +1,16 @@
+{
+  "name": "cache-magic",
+  "owner": {
+    "name": "Adam Caviness"
+  },
+  "metadata": {
+    "description": "Claude Code mods that keep large sessions from paying for a cold prompt cache"
+  },
+  "plugins": [
+    {
+      "name": "cache-handoff",
+      "source": "./cache-handoff",
+      "description": "Claude Code mod: writes a handoff while a large idle session's prompt cache is still warm, then offers to load it once the cache has gone cold."
+    }
+  ]
+}
