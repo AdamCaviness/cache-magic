@@ -1,7 +1,7 @@
 {
   "name": "cache-magic",
   "displayName": "Cache Magic",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Writes a structured handoff while a large session's prompt cache is still warm, then sends a prompt that arrives after it expired with the handoff instead of the full context",
   "author": {
     "name": "Adam Caviness"
@@ -26,21 +26,33 @@
       "title": "Cache Magic: Auto-load",
       "description": "What happens to a prompt you send after the prompt cache expired, when a handoff is ready. ask-once: ask the first time and save your answer here as auto or ask. auto: clear the session and send the prompt after the handoff. ask: ask each time. off: send it with the full context",
       "default": "ask-once",
-      "options": ["ask-once", "auto", "ask", "off"]
+      "options": [
+        "ask-once",
+        "auto",
+        "ask",
+        "off"
+      ]
     },
     "cacheTtlOverride": {
       "type": "string",
       "title": "Cache Magic: Cache TTL fallback",
       "description": "Rarely needed: the mod reads the TTL the API applied from the session transcript. This is used only before the first response that wrote to the cache. auto follows CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m",
       "default": "auto",
-      "options": ["auto", "5m", "1h"]
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ]
     },
     "generator": {
       "type": "string",
       "title": "Cache Magic: Handoff writer",
       "description": "session: the session's own model writes it from its cached context, billed at the cache-read rate, seeing everything. haiku: Haiku writes it from a trimmed transcript, uncached and seeing only the newest ~100k tokens. Cheaper per token, less complete",
       "default": "session",
-      "options": ["session", "haiku"]
+      "options": [
+        "session",
+        "haiku"
+      ]
     },
     "timeoutSeconds": {
       "type": "number",
