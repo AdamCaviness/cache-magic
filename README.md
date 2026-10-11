@@ -1,20 +1,20 @@
-# Cache Handoff
+# Cache Magic
 
 A Claude Code mod for one quota problem: a large session that sits idle past its prompt cache TTL. The next prompt, however small, re-sends the whole context at full input price. On a 900k-token session that can cost 15 to 20% of a 5-hour usage window ([anthropics/claude-code#51218](https://github.com/anthropics/claude-code/issues/51218)).
 
-Cache Handoff watches for that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/handoff.md`. When you come back, a new or resumed session offers to load the handoff instead of the full context.
+Cache Magic watches for that moment. About 30 seconds before the cache expires, while it is still warm, it writes a structured handoff of the session to `.claude/handoff.md`. When you come back, a new or resumed session offers to load the handoff instead of the full context.
 
 It is off by default.
 
 ## Install
 
-Cache Handoff is listed in [agentic-marketplace](https://github.com/adamcaviness/agentic-marketplace):
+Cache Magic is listed in [agentic-marketplace](https://github.com/adamcaviness/agentic-marketplace):
 
 ```bash
-claude plugin install cache-handoff --marketplace adamcaviness/agentic-marketplace --config enabled=true
+claude plugin install cache-magic --marketplace adamcaviness/agentic-marketplace --config enabled=true
 ```
 
-`--marketplace` adds agentic-marketplace the first time. To install now and turn it on later, leave out `--config enabled=true` and set **Cache Handoff: Enabled** in `/plugin configure cache-handoff@agentic-marketplace`.
+`--marketplace` adds agentic-marketplace the first time. To install now and turn it on later, leave out `--config enabled=true` and set **Cache Magic: Enabled** in `/plugin configure cache-magic@agentic-marketplace`.
 
 Then turn on auto-update: `/plugin` → **Marketplaces** → **agentic-marketplace** → **Enable auto-update**. Claude Code leaves it off for marketplaces outside Anthropic's, so without it you keep the version you first installed.
 
@@ -23,7 +23,7 @@ Then turn on auto-update: `/plugin` → **Marketplaces** → **agentic-marketpla
 To try it for one session from a clone of this repository, without installing:
 
 ```bash
-claude --plugin-dir . --settings '{"pluginConfigs":{"cache-handoff@inline":{"options":{"enabled":true}}}}'
+claude --plugin-dir . --settings '{"pluginConfigs":{"cache-magic@inline":{"options":{"enabled":true}}}}'
 ```
 
 `claude plugin install .` does not work: as of Claude Code 2.1.296, `install` only takes a plugin name from a marketplace.

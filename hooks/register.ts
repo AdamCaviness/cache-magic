@@ -62,7 +62,7 @@ async function logError($: EngineInterface, message: string) {
     const line = `${new Date(await $.clock.now()).toISOString()} ${message}`
     const existing = (await readText($, at(root, ERROR_LOG))) ?? ''
     await $.fs.write(at(root, ERROR_LOG), appendLog(existing, line, ERROR_LOG_LINES))
-    $.ui.log(`cache-handoff: ${message}`, { to: 'debug' })
+    $.ui.log(`cache-magic: ${message}`, { to: 'debug' })
   } catch {
     // The error log is the last resort; nothing is left to report to.
   }
@@ -164,7 +164,7 @@ async function generate($: EngineInterface, current: Idle, contextSize: number, 
   const missing = missingSections(result.text)
   if (missing.length) await logError($, `handoff written without sections: ${missing.join(', ')}`)
   const cached = generator === 'fork' ? `, ${result.usage.cache_read_input_tokens} tokens read from cache` : ''
-  $.ui.log(`cache-handoff: wrote ${HANDOFF} before the prompt cache expired${cached}`)
+  $.ui.log(`cache-magic: wrote ${HANDOFF} before the prompt cache expired${cached}`)
 }
 
 async function evaluate($: EngineInterface, current: Idle, generator: Generator, timeoutMs: number) {
@@ -188,7 +188,7 @@ async function evaluate($: EngineInterface, current: Idle, generator: Generator,
     },
   })
   if (!decision.act) {
-    $.ui.log(`cache-handoff: skipped, ${decision.reason}`, { to: 'debug' })
+    $.ui.log(`cache-magic: skipped, ${decision.reason}`, { to: 'debug' })
     // A draft may be cleared or sent before the cache lapses; look again until it does.
     if (decision.reason === 'user-typing' && secondsRemaining(cache, nowMs) * 1000 > RECHECK_MS) {
       current.timer = $.clock.after(RECHECK_MS, () => void evaluate($, current, generator, timeoutMs))

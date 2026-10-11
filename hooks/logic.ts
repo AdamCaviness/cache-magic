@@ -207,7 +207,7 @@ export function parseMeta(text: string): HandoffMeta | undefined {
 }
 
 export function renderHandoff(body: string, meta: HandoffMeta): string {
-  const header = `<!-- cache-handoff: generated ${meta.timestamp} from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
+  const header = `<!-- cache-magic: generated ${meta.timestamp} from session ${meta.sessionId} at ${meta.contextSize} context tokens -->`
   return `${header}\n${body.trim()}\n`
 }
 

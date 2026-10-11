@@ -1,6 +1,6 @@
 {
-  "name": "cache-handoff",
-  "displayName": "Cache Handoff",
+  "name": "cache-magic",
+  "displayName": "Cache Magic",
   "version": "0.1.1",
   "description": "Writes a structured handoff while a large session's prompt cache is still warm, then offers to load it once the cache has gone cold",
   "author": {
@@ -17,25 +17,25 @@
   "userConfig": {
     "enabled": {
       "type": "boolean",
-      "title": "Cache Handoff: Enabled",
-      "description": "Turns Cache Handoff on. Off by default: when on, an idle session over 50k tokens spends one model call writing .claude/handoff.md just before its prompt cache expires",
+      "title": "Cache Magic: Enabled",
+      "description": "Turns Cache Magic on. Off by default: when on, an idle session over 50k tokens spends one model call writing .claude/handoff.md just before its prompt cache expires",
       "default": false
     },
     "cacheTtlOverride": {
       "type": "string",
-      "title": "Cache Handoff: Cache TTL override",
+      "title": "Cache Magic: Cache TTL override",
       "description": "5m or 1h. Leave empty to follow CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m. Set 1h if you are on a subscription within plan usage and have not set either",
       "default": ""
     },
     "generator": {
       "type": "string",
-      "title": "Cache Handoff: Generator",
+      "title": "Cache Magic: Generator",
       "description": "fork (default) replays this session's own cached context on its own model, so input bills at the cache-read rate. haiku sends a trimmed transcript to Haiku at high effort: cheaper per token but uncached, and it sees only the newest ~100k tokens",
       "default": "fork"
     },
     "timeoutSeconds": {
       "type": "number",
-      "title": "Cache Handoff: Generation timeout",
+      "title": "Cache Magic: Generation timeout",
       "description": "Seconds to wait for the handoff before giving up and logging to .claude/handoff-error.log",
       "default": 90,
       "min": 10,

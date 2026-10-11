@@ -4,7 +4,7 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "package-name": "cache-handoff",
+      "package-name": "cache-magic",
       "changelog-path": "CHANGELOG.md",
       "changelog-sections": [
         {
