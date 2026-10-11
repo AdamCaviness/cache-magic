@@ -12,9 +12,6 @@ permissions:
 jobs:
   mod:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cache-handoff
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -22,15 +19,28 @@ jobs:
           node-version: '24'
       - name: Install pinned Claude test runtime
         run: npm install --global @anthropic-ai/claude-code@2.1.296
-      - name: Validate the marketplace
-        run: claude plugin validate --strict ..
       - name: Validate the plugin and mod
         run: claude plugin validate --strict .
       - name: Run mod tests
         run: claude plugin test .
-      # Loading the mod once writes .claude-plugin/types, which tsconfig.json
-      # extends. /cost answers locally, so this makes no model call.
+      # tsconfig.json extends .claude-plugin/types. Since 2.1.296 the engine
+      # writes it only when an interactive session loads the mod from a trusted
+      # folder, not under `claude -p`. The throwaway config marks onboarding
+      # done and the checkout trusted; the session sits at an empty prompt, not
+      # logged in, so it makes no model call.
       - name: Write runtime type declarations
-        run: CLAUDE_CONFIG_DIR="$(mktemp -d)" claude -p /cost --plugin-dir . --setting-sources '' --no-session-persistence
+        run: |
+          command -v tmux >/dev/null || { sudo apt-get update -q && sudo apt-get install -yq tmux; }
+          config="$(mktemp -d)"
+          printf '{"hasCompletedOnboarding":true,"projects":{"%s":{"hasTrustDialogAccepted":true}}}' "$(pwd -P)" > "$config/.claude.json"
+          tmux new-session -d -s types -x 200 -y 50 "CLAUDE_CONFIG_DIR='$config' claude --plugin-dir . --setting-sources ''; sleep 60"
+          for _ in $(seq 1 60); do
+            [ -f .claude-plugin/types/tsconfig.json ] && [ -f .claude-plugin/types/claude-code/index.d.ts ] && break
+            sleep 1
+          done
+          sleep 2
+          tmux capture-pane -p -t types || true
+          tmux kill-server || true
+          head -1 .claude-plugin/types/claude-code/index.d.ts
       - name: Check module types
         run: npx --yes --package typescript@5.9.3 tsc -p .
