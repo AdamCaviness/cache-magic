@@ -24,7 +24,7 @@
     "cacheTtlOverride": {
       "type": "string",
       "title": "Cache Magic: Cache TTL override",
-      "description": "5m or 1h. Leave empty to follow CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m. Set 1h if you are on a subscription within plan usage and have not set either",
+      "description": "5m or 1h, used only until the session transcript shows the TTL the API applied. Leave empty to follow CLAUDE_CODE_PROMPT_CACHE_TTL, then the promptCacheTtl setting, then 5m",
       "default": ""
     },
     "generator": {

@@ -8,6 +8,7 @@ import {
   lastRealRowAt,
   loadMessage,
   missingSections,
+  observeCache,
   offerQuestion,
   parseMeta,
   renderHandoff,
@@ -20,7 +21,9 @@ import {
   TTL_SECONDS,
   turnHasEnded,
   type HandoffMeta,
+  type ResolvedTtl,
   type Ttl,
+  type TtlSource,
 } from './logic'
 
 const DIR = '.claude'
@@ -31,6 +34,8 @@ const PRIOR_SLOTS = [`${DIR}/handoff.1.md`, `${DIR}/handoff.2.md`, `${DIR}/hando
 const DEFAULT_TIMEOUT_SECONDS = 90
 const RECHECK_MS = 5_000
 const MAX_FS_BYTES = 4 * 1024 * 1024
+// Enough for the newest response and the request before it, even past a large tool result.
+const TAIL_BYTES = 2 * 1024 * 1024
 const ERROR_LOG_LINES = 200
 const HAIKU_DIGEST_CHARS = 400_000
 const HAIKU_MAX_TOKENS = 8_000
@@ -38,7 +43,17 @@ const YES = 'Yes, clear and load it'
 const NO = 'No'
 
 type Timer = { cancel: () => void }
-type Idle = { stoppedAt: number; sessionId: string; transcriptPath: string; ttl: Ttl; claimed: boolean; timer?: Timer }
+type Idle = {
+  stoppedAt: number
+  // When the cache's clock last restarted: the newest request, or the Stop when the transcript can't say.
+  cacheFrom: number
+  sessionId: string
+  transcriptPath: string
+  ttl: Ttl
+  ttlSource: TtlSource
+  claimed: boolean
+  timer?: Timer
+}
 type Generator = 'fork' | 'haiku'
 type Plan = { override: unknown; generator: Generator; timeoutMs: number }
 
@@ -68,9 +83,23 @@ async function logError($: EngineInterface, message: string) {
   }
 }
 
-async function sessionTtl($: EngineInterface, override: unknown): Promise<Ttl> {
+// The transcript's newest rows, however large it has grown.
+async function transcriptTail($: EngineInterface, path: string): Promise<string | undefined> {
+  if (!path) return undefined
+  try {
+    const result = await $.process.run(['tail', '-c', String(TAIL_BYTES), path], { timeoutMs: 3_000 })
+    if (result.exitCode === 0) return result.stdout
+  } catch {
+    // Where tail can't run, a transcript within the read limit is read whole.
+  }
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  return stat && stat.size <= MAX_FS_BYTES ? readText($, path) : undefined
+}
+
+async function sessionTtl($: EngineInterface, override: unknown, observed: Ttl | undefined): Promise<ResolvedTtl> {
   const settings = (await $.settings.read().catch(() => ({}))) as { promptCacheTtl?: unknown }
   return resolveTtl({
+    observed,
     override,
     force5m: await $.env.get('FORCE_PROMPT_CACHING_5M'),
     env: await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'),
@@ -85,9 +114,9 @@ async function turnEnded($: EngineInterface, current: Idle): Promise<boolean> {
   if (current.transcriptPath) {
     const stat = await $.fs.stat(current.transcriptPath).catch(() => undefined)
     mtimeMs = stat?.mtimeMs
-    // Only a transcript past the stop needs its rows read; one over the read limit leaves the turn flag to decide.
-    if (stat && mtimeMs !== undefined && mtimeMs > current.stoppedAt && stat.size <= MAX_FS_BYTES) {
-      const text = await readText($, current.transcriptPath)
+    // Only a transcript past the stop needs its rows read; one that can't be read leaves the turn flag to decide.
+    if (stat && mtimeMs !== undefined && mtimeMs > current.stoppedAt) {
+      const text = await transcriptTail($, current.transcriptPath)
       if (text !== undefined) lastRow = lastRealRowAt(text)
     }
   }
@@ -171,7 +200,7 @@ async function evaluate($: EngineInterface, current: Idle, generator: Generator,
   if (idle !== current || generating) return
   const nowMs = await $.clock.now()
   const contextSize = (await $.session.usage()).context.tokens ?? 0
-  const cache = snapshotFrom(current.stoppedAt, current.ttl, contextSize, nowMs)
+  const cache = snapshotFrom(current.cacheFrom, current.ttl, contextSize, nowMs)
   const root = await $.session.root()
   const meta = parseMeta((await readText($, at(root, META))) ?? '')
   const turns = await $.session.turns()
@@ -211,10 +240,22 @@ async function turnEndedAt($: EngineInterface, e: { session_id: string; transcri
   try {
     idle?.timer?.cancel()
     const stoppedAt = await $.clock.now()
-    const ttl = await sessionTtl($, plan.override)
-    const current: Idle = { stoppedAt, sessionId: e.session_id, transcriptPath: e.transcript_path, ttl, claimed: false }
+    const tail = await transcriptTail($, e.transcript_path)
+    const observed = tail === undefined ? {} : observeCache(tail)
+    const { ttl, source } = await sessionTtl($, plan.override, observed.ttl)
+    const cacheFrom = observed.requestAt !== undefined && observed.requestAt <= stoppedAt ? observed.requestAt : stoppedAt
+    const current: Idle = {
+      stoppedAt,
+      cacheFrom,
+      sessionId: e.session_id,
+      transcriptPath: e.transcript_path,
+      ttl,
+      ttlSource: source,
+      claimed: false,
+    }
     idle = current
-    const elapsed = (await $.clock.now()) - stoppedAt
+    $.ui.log(`cache-magic: cache TTL ${ttl} (${source}), from ${new Date(cacheFrom).toISOString()}`, { to: 'debug' })
+    const elapsed = (await $.clock.now()) - cacheFrom
     const delay = Math.max(0, (TTL_SECONDS[ttl] - TRIGGER_WINDOW_SECONDS) * 1000 - elapsed)
     current.timer = $.clock.after(delay, () => void evaluate($, current, plan.generator, plan.timeoutMs))
   } catch (error) {

@@ -33,15 +33,15 @@ claude --plugin-dir . --settings '{"pluginConfigs":{"cache-magic@inline":{"optio
 | Option | Default | What it does |
 | --- | --- | --- |
 | `enabled` | `false` | Turns the mod on. When off, it registers no hooks. |
-| `cacheTtlOverride` | empty | `5m` or `1h`. Empty follows Claude Code's own order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H`, then `5m`. |
+| `cacheTtlOverride` | empty | `5m` or `1h`, used only when the transcript doesn't yet show the TTL (see below). Empty follows Claude Code's own order: `FORCE_PROMPT_CACHING_5M`, `CLAUDE_CODE_PROMPT_CACHE_TTL`, the `promptCacheTtl` setting, `ENABLE_PROMPT_CACHING_1H`, then `5m`. |
 | `generator` | `fork` | How the handoff is written; see Cost below. `haiku` is the alternative. |
 | `timeoutSeconds` | `90` | How long to wait for the handoff before giving up and logging the failure. |
 
-**Set `cacheTtlOverride` to `1h` if you are on a Claude subscription within plan usage and haven't set a TTL yourself.** Claude Code gives the main conversation a one-hour cache there, but a mod can't see your billing state. With nothing set, the mod assumes 5 minutes, so it writes the handoff early rather than late.
+**You don't need to set the TTL.** Every response the API returns records how many tokens it wrote to the cache at each TTL (`cache_creation.ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`), and Claude Code keeps that in the session transcript. The mod reads the newest response's split, so it knows whether this session's cache lasts five minutes or an hour, whatever your plan or billing state. The override and settings matter only before the first response that wrote to the cache.
 
 ## What happens
 
-**At the end of a turn** (the `Stop` or `TeammateIdle` hook), the mod notes the time and starts a timer for 30 seconds before the TTL runs out. The hook returns right away. Nothing runs on `UserPromptSubmit` or `PreToolUse`, and no model call waits on a turn. The `turn.start` hook only cancels the timer.
+**At the end of a turn** (the `Stop` or `TeammateIdle` hook), the mod reads the transcript's newest rows for the cache's TTL and for when the turn's last request was sent. The cache's clock restarts at each request, not when the response ends, so a long response doesn't make the mod late. It starts a timer for 30 seconds before the TTL runs out, counted from that request. The hook returns right away. Nothing runs on `UserPromptSubmit` or `PreToolUse`, and no model call waits on a turn. The `turn.start` hook only cancels the timer.
 
 **When the timer fires**, the mod writes a handoff only if all of these hold:
 
@@ -84,10 +84,10 @@ The `haiku` generator calls `$.model.complete` with Haiku at high effort. **Haik
 These are limits of the mods API as of Claude Code 2.1.296:
 
 - **No model choice on a cached fork.** `$.model.fork` takes only a prompt. It always runs on the session's model, with no effort, token cap, or timeout setting. The mod's timeout stops waiting but can't cancel the request. Since cache reads are tied to the model, a cheap model reading the session's cache isn't possible.
-- **Mods don't receive the statusLine payload.** The statusLine's `prompt_cache.expires_at` goes only to the statusLine command. The mod computes the same expiry, one TTL after the turn's last response. Its internal `CacheSnapshot` uses the statusLine field names (`warm`, `ttl`, `expires_at`, `recache_tokens_if_cold`).
-- **The TTL can't be read.** The mod can read the TTL settings and environment variables, but not whether a subscription is drawing on usage credits, which switches the default from 1h to 5m. Hence the `cacheTtlOverride` option.
+- **Mods don't receive the statusLine payload.** The statusLine's `prompt_cache.expires_at` goes only to the statusLine command. The mod computes the expiry itself, one TTL after the turn's last request. Its internal `CacheSnapshot` uses the statusLine field names (`warm`, `ttl`, `expires_at`, `recache_tokens_if_cold`).
+- **No hook reports the cache TTL.** Only the model-switch hooks carry `cache_ttl`. The mod reads it from the transcript's usage rows instead.
 - **`$.fs` can't delete or rename.** A timestamp-named file per version would pile up with no way to prune it, so prior versions rotate through three fixed slots instead.
-- **`$.fs.read` stops at 4 MiB.** For a transcript larger than that, the turn-ended check can't read the newest rows. It relies on the mod's own turn tracking from `turn.start` and `Stop`.
+- **`$.fs.read` stops at 4 MiB and reads whole files.** A long session's transcript is larger, so the mod reads its last 2 MiB with `tail` through `$.process.run`. Where `tail` can't run, it reads a transcript within 4 MiB whole, and past that falls back to the configured TTL and its own turn tracking from `turn.start` and `Stop`.
 - **A fork can't call tools.** The working tree status in the handoff comes from one `git status` the mod runs itself through `$.process.run`, with a 3-second timeout.
 
 The fallback of having the main agent write the handoff itself, through a reminder injected at `Stop`, isn't needed: `$.model.fork` covers the case without starting a turn.

@@ -6,6 +6,7 @@ import {
   filesModified,
   lastRealRowAt,
   missingSections,
+  observeCache,
   offerQuestion,
   parseMeta,
   resolveTtl,
@@ -80,7 +81,14 @@ function world(on: On, setup: Setup = {}): World {
     value: { startedAt: T0 - 3_600_000, context: { tokens: setup.tokens ?? 900_000, window: 1_000_000, percent: 90 }, rateLimits: [] },
   }))
   on('prompt.read', () => ({ value: { text: setup.draft ?? '', cursor: 0 } }))
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '## main\n M src/login.test.ts\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
+  on('process.run', ($, e) => {
+    const ran = (exitCode: number, stdout: string) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (e.argv[0] === 'tail') {
+      const text = state.files.get(e.argv[e.argv.length - 1]!)
+      return text === undefined ? ran(1, '') : ran(0, text)
+    }
+    return ran(0, '## main\n M src/login.test.ts\n')
+  })
   on('ui.log', () => ({ value: undefined }))
   on('fs.read', ($, e) => {
     const text = state.files.get(e.path)
@@ -122,6 +130,20 @@ function world(on: On, setup: Setup = {}): World {
 
 const stop = { stop_hook_active: false, last_assistant_message: 'Done.', transcript_path: '', session_id: 'session-a' } as const
 
+const TRANSCRIPT = '/home/me/.claude/projects/p/session-a.jsonl'
+const iso = (ms: number) => new Date(ms).toISOString()
+const jsonl = (rows: object[]) => rows.map(row => JSON.stringify(row)).join('\n')
+const written = (fiveMinute: number, oneHour: number) => ({
+  usage: { cache_creation: { ephemeral_5m_input_tokens: fiveMinute, ephemeral_1h_input_tokens: oneHour } },
+})
+
+// A turn whose last request went out at `requestAt` and wrote to the cache at the given TTLs.
+const turn = (requestAt: number, fiveMinute: number, oneHour: number) =>
+  jsonl([
+    { type: 'user', timestamp: iso(requestAt) },
+    { type: 'assistant', timestamp: iso(T0 - 500), message: written(fiveMinute, oneHour) },
+  ])
+
 const meta = (overrides: Partial<HandoffMeta> = {}): HandoffMeta => ({
   timestamp: new Date(T0 - 10 * 60_000).toISOString(),
   sessionId: 'session-a',
@@ -148,13 +170,34 @@ describe('trigger logic', () => {
     expect(decide({ ...IDLE, cache: snapshotFrom(lastResponse, '5m', 900_000, T0) })).toEqual({ act: false, reason: 'cache-cold' })
   })
 
-  test('resolves the TTL: override, then FORCE_PROMPT_CACHING_5M, env, setting, ENABLE_PROMPT_CACHING_1H, then 5m', () => {
-    expect(resolveTtl({ override: '1h', force5m: '1' })).toBe('1h')
-    expect(resolveTtl({ override: '', force5m: '1', env: '1h' })).toBe('5m')
-    expect(resolveTtl({ env: '1h', setting: '5m' })).toBe('1h')
-    expect(resolveTtl({ env: 'bogus', setting: '1h' })).toBe('1h')
-    expect(resolveTtl({ enable1h: '1' })).toBe('1h')
-    expect(resolveTtl({})).toBe('5m')
+  test('resolves the TTL: observed, override, FORCE_PROMPT_CACHING_5M, env, setting, ENABLE_PROMPT_CACHING_1H, then 5m', () => {
+    expect(resolveTtl({ observed: '1h', override: '5m', force5m: '1' })).toEqual({ ttl: '1h', source: 'observed' })
+    expect(resolveTtl({ override: '1h', force5m: '1' })).toEqual({ ttl: '1h', source: 'configured' })
+    expect(resolveTtl({ override: '', force5m: '1', env: '1h' })).toEqual({ ttl: '5m', source: 'configured' })
+    expect(resolveTtl({ env: '1h', setting: '5m' })).toEqual({ ttl: '1h', source: 'configured' })
+    expect(resolveTtl({ env: 'bogus', setting: '1h' })).toEqual({ ttl: '1h', source: 'configured' })
+    expect(resolveTtl({ enable1h: '1' })).toEqual({ ttl: '1h', source: 'configured' })
+    expect(resolveTtl({})).toEqual({ ttl: '5m', source: 'assumed' })
+  })
+
+  test('reads the TTL and the last request time off the main conversation in the transcript', () => {
+    const rows = [
+      { type: 'user', timestamp: iso(T0 - 120_000) },
+      { type: 'assistant', timestamp: iso(T0 - 100_000), message: written(0, 500) },
+      { type: 'user', timestamp: iso(T0 - 60_000) },
+      { type: 'assistant', timestamp: iso(T0 - 5_000), message: written(0, 800) },
+      { type: 'assistant', isSidechain: true, timestamp: iso(T0 - 2_000), message: written(900, 0) },
+      { type: 'user', isMeta: true, timestamp: iso(T0 - 1_000) },
+      { type: 'system', subtype: 'turn_duration', timestamp: iso(T0 + 1_000) },
+    ]
+    expect(observeCache(jsonl(rows))).toEqual({ ttl: '1h', requestAt: T0 - 60_000 })
+    expect(observeCache(turn(T0 - 1_000, 300, 0))).toEqual({ ttl: '5m', requestAt: T0 - 1_000 })
+    expect(observeCache(turn(T0 - 1_000, 300, 40_000)).ttl).toBe('5m')
+    // A response served wholly from cache wrote nothing; an earlier write still names the TTL.
+    const cached = [...rows.slice(0, 3), { type: 'assistant', timestamp: iso(T0 - 5_000), message: written(0, 0) }]
+    expect(observeCache(jsonl(cached))).toEqual({ ttl: '1h', requestAt: T0 - 60_000 })
+    expect(observeCache(jsonl([{ type: 'user', timestamp: iso(T0) }]))).toEqual({ ttl: undefined, requestAt: undefined })
+    expect(observeCache('{"type":"assistant","times')).toEqual({ ttl: undefined, requestAt: undefined })
   })
 })
 
@@ -226,6 +269,37 @@ describe('handoff generation', () => {
     expect(state.forks).toHaveLength(1)
   })
 
+  test('a 1h TTL read off the transcript holds the handoff for the hour, with no override set', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { files: { [TRANSCRIPT]: turn(T0 - 1_000, 0, 800) } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(300_000)
+    expect(state.forks).toHaveLength(0)
+    await clock.advance(3_568_000 - 300_000)
+    expect(state.forks).toHaveLength(0)
+    await clock.advance(1_000)
+    expect(state.forks).toHaveLength(1)
+    expect(parseMeta(state.files.get(`${ROOT}/.claude/handoff.meta.json`)!)?.cacheTtl).toBe('1h')
+  })
+
+  test('the observed TTL wins over the override', { options: { enabled: true, cacheTtlOverride: '1h' } }, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { files: { [TRANSCRIPT]: turn(T0 - 1_000, 300, 0) } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(269_000)
+    expect(state.forks).toHaveLength(1)
+  })
+
+  test('counts the cache from the last request, not the Stop, so a long response does not make it late', ENABLED, async ($, on) => {
+    const clock = mock.clock(on, { now: T0 })
+    const state = world(on, { files: { [TRANSCRIPT]: turn(T0 - 60_000, 300, 0) } })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
+    await clock.advance(209_000)
+    expect(state.forks).toHaveLength(0)
+    await clock.advance(1_000)
+    expect(state.forks).toHaveLength(1)
+  })
+
   test('keeps the prior three handoffs in rotation slots', ENABLED, async ($, on) => {
     const clock = mock.clock(on, { now: T0 })
     const state = world(on, {
@@ -281,13 +355,12 @@ describe('handoff generation', () => {
 
   test('a user row written after Stop means the turn did not end, so nothing forks', ENABLED, async ($, on) => {
     const clock = mock.clock(on, { now: T0 })
-    const transcript = '/home/me/.claude/projects/p/session-a.jsonl'
     const rows = [
-      { type: 'assistant', timestamp: new Date(T0 - 1_000).toISOString() },
-      { type: 'user', timestamp: new Date(T0 + 60_000).toISOString() },
+      { type: 'assistant', timestamp: iso(T0 - 1_000) },
+      { type: 'user', timestamp: iso(T0 + 60_000) },
     ]
-    const state = world(on, { files: { [transcript]: rows.map(row => JSON.stringify(row)).join('\n') }, transcriptMtimeMs: T0 + 60_000 })
-    await $.classic.Stop({ ...stop, transcript_path: transcript })
+    const state = world(on, { files: { [TRANSCRIPT]: jsonl(rows) }, transcriptMtimeMs: T0 + 60_000 })
+    await $.classic.Stop({ ...stop, transcript_path: TRANSCRIPT })
     await clock.advance(300_000)
     expect(state.forks).toHaveLength(0)
   })

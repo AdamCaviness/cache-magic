@@ -28,6 +28,7 @@ export function parseTtl(value: unknown): Ttl | undefined {
 }
 
 export type TtlSources = {
+  observed?: Ttl
   override?: unknown
   force5m?: string
   env?: string
@@ -35,14 +36,71 @@ export type TtlSources = {
   enable1h?: string
 }
 
-// Claude Code's own precedence, with the mod's override first. Unset falls to
-// 5m: a subscription's 1h default drops to 5m on usage credits, and firing
-// early is cheap where firing late misses the cache.
-export function resolveTtl(sources: TtlSources): Ttl {
+// `observed`: read off the transcript. `configured`: the override, an env
+// variable or a setting. `assumed`: nothing said, so 5m.
+export type TtlSource = 'observed' | 'configured' | 'assumed'
+
+export type ResolvedTtl = { ttl: Ttl; source: TtlSource }
+
+// The TTL the API recorded wins. Without one, Claude Code's own precedence,
+// with the mod's override first. Unset falls to 5m: a subscription's 1h
+// default drops to 5m on usage credits, and firing early is cheap where
+// firing late misses the cache.
+export function resolveTtl(sources: TtlSources): ResolvedTtl {
+  if (sources.observed) return { ttl: sources.observed, source: 'observed' }
+  const configured = (ttl: Ttl): ResolvedTtl => ({ ttl, source: 'configured' })
   const override = parseTtl(sources.override)
-  if (override) return override
-  if (sources.force5m === '1') return '5m'
-  return parseTtl(sources.env) ?? parseTtl(sources.setting) ?? (sources.enable1h === '1' ? '1h' : '5m')
+  if (override) return configured(override)
+  if (sources.force5m === '1') return configured('5m')
+  const stated = parseTtl(sources.env) ?? parseTtl(sources.setting) ?? (sources.enable1h === '1' ? '1h' : undefined)
+  return stated ? configured(stated) : { ttl: '5m', source: 'assumed' }
+}
+
+export type CacheObservation = { ttl?: Ttl; requestAt?: number }
+
+type TranscriptRow = {
+  type?: unknown
+  isMeta?: unknown
+  isSidechain?: unknown
+  timestamp?: unknown
+  message?: { usage?: { cache_creation?: { ephemeral_5m_input_tokens?: unknown; ephemeral_1h_input_tokens?: unknown } } }
+}
+
+const count = (value: unknown) => (typeof value === 'number' ? value : 0)
+
+const rowTime = (row: TranscriptRow) => (typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN)
+
+// From the main conversation's newest rows: the TTL the API applied to its
+// newest cache write (each response records its writes by TTL), and when the
+// request behind its newest response was sent, which is when the cache's
+// clock restarted. A response with writes at both TTLs counts as 5m, the TTL
+// of the conversation's own tail.
+export function observeCache(jsonl: string): CacheObservation {
+  const lines = jsonl.split('\n')
+  let ttl: Ttl | undefined
+  let requestAt: number | undefined
+  let sawResponse = false
+  for (let index = lines.length - 1; index >= 0 && (ttl === undefined || requestAt === undefined); index--) {
+    const line = lines[index]!.trim()
+    if (!line) continue
+    let row: TranscriptRow
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row.isSidechain === true || row.isMeta === true) continue
+    if (row.type === 'assistant') {
+      sawResponse = true
+      const written = row.message?.usage?.cache_creation
+      if (ttl === undefined && count(written?.ephemeral_5m_input_tokens) > 0) ttl = '5m'
+      else if (ttl === undefined && count(written?.ephemeral_1h_input_tokens) > 0) ttl = '1h'
+    } else if (row.type === 'user' && sawResponse && requestAt === undefined) {
+      const at = rowTime(row)
+      if (Number.isFinite(at)) requestAt = at
+    }
+  }
+  return { ttl, requestAt }
 }
 
 // The statusLine payload's `prompt_cache` fields this mod reads.
@@ -112,14 +170,14 @@ export function lastRealRowAt(jsonl: string): number | undefined {
   for (let index = lines.length - 1; index >= 0; index--) {
     const line = lines[index]!.trim()
     if (!line) continue
-    let row: { type?: unknown; isMeta?: unknown; timestamp?: unknown }
+    let row: TranscriptRow
     try {
       row = JSON.parse(line)
     } catch {
       continue
     }
     if ((row.type !== 'user' && row.type !== 'assistant') || row.isMeta === true) continue
-    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN
+    const at = rowTime(row)
     if (Number.isFinite(at)) return at
   }
   return undefined
